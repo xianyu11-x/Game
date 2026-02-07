@@ -29,6 +29,21 @@ self.time_horizon = 2.0      # 碰撞预测时间范围(秒)
 self.max_neighbors = 10      # 考虑的最大邻居数量
 self.neighbor_dist = 150.0   # 邻居检测距离(像素)
 self.max_speed = 200.0       # 最大速度限制(像素/秒)
+self.turn_penalty_weight = 0.6         # 大转向惩罚权重
+self.turn_penalty_threshold_deg = 45.0 # 超过该角度才惩罚
+self.opposite_suppression_enabled = True
+self.opposite_angle_threshold_deg = 30.0
+self.reverse_cooldown_enabled = True
+self.reverse_cooldown_base = 0.4
+self.reverse_cooldown_max = 5.0
+self.reverse_cooldown_growth = 2.0
+self.reverse_cooldown_decay = 0.8
+self.reverse_extreme_threshold_deg = 120.0
+self.concave_detection_enabled = True
+self.concave_progress_epsilon = 1.5
+self.concave_time_growth = 0.6
+self.concave_time_max = 4.0
+self.concave_decay = 0.8
 ```
 
 ### 参数调优建议
@@ -52,6 +67,19 @@ self.max_speed = 200.0       # 最大速度限制(像素/秒)
   - 应与智能体的实际速度范围匹配
   - 过大会导致速度不受限制
   - 过小会限制智能体移动
+
+- **turn_penalty_weight / turn_penalty_threshold_deg**:
+  - 抑制大幅度转向,减少抖动
+  - threshold 越小,越容易触发惩罚
+
+- **opposite_suppression_enabled / opposite_angle_threshold_deg**:
+  - 抑制与当前方向相反的突变
+
+- **reverse_cooldown_***:
+  - 频繁反向时触发冷却,降低“左右摇摆”
+
+- **concave_***:
+  - 卡住时自动增大 time_horizon,提升绕出凹形区域的成功率
 
 ## 使用方法
 

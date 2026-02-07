@@ -1,6 +1,7 @@
 import pygame
 import sys
 import math
+import avoidance_config
 from avoidance_manager import AvoidanceManager
 
 # Initialize Pygame
@@ -73,24 +74,86 @@ def get_collision_response(circle, other_circles):
     
     return push_x, push_y
 
+def get_closest_reachable_target(
+    circle,
+    target_x,
+    target_y,
+    target_radius,
+    all_circles,
+    extra_margin=5.0,
+):
+    """Return closest reachable point on the Minkowski circle around the target."""
+    if target_radius <= 0.0:
+        return target_x, target_y
+
+    base_radius = circle["radius"] + target_radius + extra_margin
+    desired_angle = math.atan2(circle["y"] - target_y, circle["x"] - target_x)
+
+    samples = 48
+    best_point = None
+    best_angle_diff = None
+
+    for i in range(samples):
+        angle = (2 * math.pi * i) / samples
+        candidate_x = target_x + base_radius * math.cos(angle)
+        candidate_y = target_y + base_radius * math.sin(angle)
+
+        ok = True
+        for other in all_circles:
+            if other is circle:
+                continue
+            min_dist = circle["radius"] + other["radius"] + extra_margin
+            if math.hypot(candidate_x - other["x"], candidate_y - other["y"]) < min_dist:
+                ok = False
+                break
+
+        if not ok:
+            continue
+
+        angle_diff = abs((angle - desired_angle + math.pi) % (2 * math.pi) - math.pi)
+        if best_point is None or angle_diff < best_angle_diff:
+            best_point = (candidate_x, candidate_y)
+            best_angle_diff = angle_diff
+
+    if best_point is not None:
+        return best_point
+
+    return target_x, target_y
+
 def move_circle_towards_target(circle, delta_time, all_circles, avoidance_algorithm):
     """Move circle towards its target position with speed and rotation, using avoidance plugin"""
     if circle["target_x"] is None or circle["target_y"] is None:
         return
-    
-    # Calculate direction to target
-    dx = circle["target_x"] - circle["x"]
-    dy = circle["target_y"] - circle["y"]
-    distance = (dx ** 2 + dy ** 2) ** 0.5
-    
-    # Check if reached target
-    # Default to precise arrival (distance < 5) if not specified
+
+    extra_margin = 5.0
+    target_radius = circle.get("target_radius", 0.0) or 0.0
+    base_radius = circle["radius"] + target_radius + extra_margin if target_radius > 0.0 else 0.0
+    reach_x, reach_y = get_closest_reachable_target(
+        circle,
+        circle["target_x"],
+        circle["target_y"],
+        target_radius,
+        all_circles,
+        extra_margin=extra_margin,
+    )
+    if avoidance_config.DEBUG_ENABLED:
+        circle["debug_reachable_target"] = (reach_x, reach_y)
+    else:
+        circle["debug_reachable_target"] = None
+
+    distance_to_target = math.hypot(circle["target_x"] - circle["x"], circle["target_y"] - circle["y"])
     arrival_threshold = circle.get("arrival_threshold", 5)
-    
-    if distance < arrival_threshold:
+    if distance_to_target < arrival_threshold:
         circle["target_x"] = None
         circle["target_y"] = None
+        circle["target_radius"] = None
+        circle["target_ref"] = None
+        circle["debug_reachable_target"] = None
         return
+    
+    # Calculate direction to target
+    dx = reach_x - circle["x"]
+    dy = reach_y - circle["y"]
     
     # Calculate target angle (in degrees)
     target_angle = math.degrees(math.atan2(dy, dx))
@@ -121,14 +184,14 @@ def move_circle_towards_target(circle, delta_time, all_circles, avoidance_algori
     # Use avoidance algorithm if available
     if avoidance_algorithm:
         result = avoidance_algorithm.calculate_avoidance(
-            circle, circle["target_x"], circle["target_y"], all_circles, delta_time
+            circle, reach_x, reach_y, all_circles, delta_time
         )
         if result:
             new_x, new_y, new_angle = result
             circle["x"] = new_x
             circle["y"] = new_y
-            # Optionally update angle from avoidance algorithm
-            # circle["angle"] = new_angle
+            # Update angle from avoidance algorithm for smoother behavior
+            circle["angle"] = new_angle
     else:
         # Fallback to simple movement
         move_distance = circle["speed"] * delta_time
@@ -142,6 +205,31 @@ def move_circle_towards_target(circle, delta_time, all_circles, avoidance_algori
         circle["x"] += push_x
         circle["y"] += push_y
 
+        distance_to_target = math.hypot(circle["target_x"] - circle["x"], circle["target_y"] - circle["y"])
+        if distance_to_target < arrival_threshold:
+            circle["target_x"] = None
+            circle["target_y"] = None
+            circle["target_radius"] = None
+            circle["target_ref"] = None
+            circle["debug_reachable_target"] = None
+            return
+
+        if target_radius > 0.0 and distance_to_target < base_radius:
+            reach_x, reach_y = get_closest_reachable_target(
+                circle,
+                circle["target_x"],
+                circle["target_y"],
+                target_radius,
+                all_circles,
+                extra_margin=extra_margin,
+            )
+            if avoidance_config.DEBUG_ENABLED:
+                circle["debug_reachable_target"] = (reach_x, reach_y)
+            else:
+                circle["debug_reachable_target"] = None
+            circle["x"] = reach_x
+            circle["y"] = reach_y
+
 def draw_grid(surface, camera_x, camera_y):
     """Draw grid background"""
     grid_size = 50
@@ -151,6 +239,174 @@ def draw_grid(surface, camera_x, camera_y):
     # Horizontal lines
     for y in range(-camera_y % grid_size, WINDOW_HEIGHT, grid_size):
         pygame.draw.line(surface, (200, 200, 200), (0, y), (WINDOW_WIDTH, y), 1)
+
+def draw_allowed_angles(surface, circle, camera_x, camera_y, color=(0, 255, 0, 60)):
+    """Draw feasible movement area as translucent sectors on the detection circle."""
+    intervals = circle.get("debug_allowed_intervals")
+    detection_radius = circle.get("debug_detection_radius")
+    if not intervals or not detection_radius:
+        return
+
+    screen_x, screen_y = world_to_screen(circle["x"], circle["y"], camera_x, camera_y)
+    step = max(2.0, circle.get("debug_angle_step", 10.0) / 2.0)
+
+    overlay = pygame.Surface((WINDOW_WIDTH, WINDOW_HEIGHT), pygame.SRCALPHA)
+
+    for start, end in intervals:
+        if end <= start:
+            continue
+        points = [(screen_x, screen_y)]
+        angle = start
+        while angle <= end:
+            end_x = screen_x + detection_radius * math.cos(math.radians(angle))
+            end_y = screen_y + detection_radius * math.sin(math.radians(angle))
+            points.append((end_x, end_y))
+            angle += step
+
+        end_x = screen_x + detection_radius * math.cos(math.radians(end))
+        end_y = screen_y + detection_radius * math.sin(math.radians(end))
+        points.append((end_x, end_y))
+
+        if len(points) >= 3:
+            pygame.draw.polygon(overlay, color, points)
+
+    surface.blit(overlay, (0, 0))
+
+def draw_velocity_direction(surface, circle, camera_x, camera_y, color=(255, 120, 0)):
+    """Draw current velocity direction using detection radius as length if available."""
+    detection_radius = circle.get("debug_detection_radius") or 40
+    screen_x, screen_y = world_to_screen(circle["x"], circle["y"], camera_x, camera_y)
+    end_x = screen_x + detection_radius * math.cos(math.radians(circle["angle"]))
+    end_y = screen_y + detection_radius * math.sin(math.radians(circle["angle"]))
+    pygame.draw.line(surface, color, (int(screen_x), int(screen_y)), (int(end_x), int(end_y)), 2)
+
+def draw_minkowski_circles(surface, circle, camera_x, camera_y, color=(255, 0, 0)):
+    """Draw predicted Minkowski circles for detected obstacles."""
+    minkowski_circles = circle.get("debug_minkowski_circles")
+    if not minkowski_circles:
+        return
+
+    for entry in minkowski_circles:
+        center_x, center_y = entry["center"]
+        radius = entry["radius"]
+        screen_x, screen_y = world_to_screen(center_x, center_y, camera_x, camera_y)
+        pygame.draw.circle(surface, color, (int(screen_x), int(screen_y)), int(radius), 1)
+
+def draw_reverse_cooldown(surface, circle, camera_x, camera_y, font, color=(160, 0, 160)):
+    """Draw reverse cooldown timer for a circle if active."""
+    cooldown = circle.get("reverse_cooldown", 0.0)
+    if cooldown <= 0.0:
+        return
+
+    screen_x, screen_y = world_to_screen(circle["x"], circle["y"], camera_x, camera_y)
+    text = f"CD {cooldown:.1f}s x{circle.get('reverse_extreme_count', 0)}"
+    label_surface = font.render(text, True, color)
+    label_rect = label_surface.get_rect(center=(int(screen_x), int(screen_y + 35)))
+    surface.blit(label_surface, label_rect)
+
+def draw_orca_debug(surface, circle, camera_x, camera_y, font,
+                    pref_color=(0, 120, 255), new_color=(255, 80, 0),
+                    radius_color=(80, 160, 255)):
+    """Draw ORCA debug visuals: neighbor range and preferred/selected velocities."""
+    neighbor_dist = circle.get("debug_orca_neighbor_dist")
+    pref_vel = circle.get("debug_orca_pref_velocity")
+    new_vel = circle.get("debug_orca_new_velocity")
+    scale = circle.get("debug_orca_velocity_scale", 0.5)
+    time_horizon = circle.get("debug_orca_time_horizon")
+
+    if neighbor_dist is None and pref_vel is None and new_vel is None and time_horizon is None:
+        return
+
+    screen_x, screen_y = world_to_screen(circle["x"], circle["y"], camera_x, camera_y)
+
+    if neighbor_dist:
+        pygame.draw.circle(surface, radius_color, (int(screen_x), int(screen_y)), int(neighbor_dist), 1)
+
+    if pref_vel is not None:
+        end_x = screen_x + pref_vel[0] * scale
+        end_y = screen_y + pref_vel[1] * scale
+        pygame.draw.line(surface, pref_color, (int(screen_x), int(screen_y)), (int(end_x), int(end_y)), 2)
+        pygame.draw.circle(surface, pref_color, (int(end_x), int(end_y)), 3, 0)
+
+    if new_vel is not None:
+        end_x = screen_x + new_vel[0] * scale
+        end_y = screen_y + new_vel[1] * scale
+        pygame.draw.line(surface, new_color, (int(screen_x), int(screen_y)), (int(end_x), int(end_y)), 2)
+        pygame.draw.circle(surface, new_color, (int(end_x), int(end_y)), 3, 0)
+
+    if time_horizon is not None and font is not None:
+        text = f"TH {time_horizon:.2f}s"
+        label_surface = font.render(text, True, (40, 40, 40))
+        label_rect = label_surface.get_rect(center=(int(screen_x), int(screen_y + 55)))
+        surface.blit(label_surface, label_rect)
+
+def draw_orca_constraints(surface, circle, camera_x, camera_y,
+                          line_color=(60, 60, 60), normal_color=(120, 0, 200, 160)):
+    """Draw ORCA constraint lines and approximate half-planes in velocity space."""
+    orca_lines = circle.get("debug_orca_lines")
+    if not orca_lines:
+        return
+
+    scale = circle.get("debug_orca_velocity_scale", 0.5)
+    screen_x, screen_y = world_to_screen(circle["x"], circle["y"], camera_x, camera_y)
+
+    overlay = pygame.Surface((WINDOW_WIDTH, WINDOW_HEIGHT), pygame.SRCALPHA)
+
+    for line in orca_lines:
+        point = line.get("point")
+        direction = line.get("direction")
+        if not point or not direction:
+            continue
+
+        normal_x, normal_y = direction
+        normal_len = math.hypot(normal_x, normal_y)
+        if normal_len < 1e-6:
+            continue
+
+        normal_x /= normal_len
+        normal_y /= normal_len
+        tangent_x = -normal_y
+        tangent_y = normal_x
+
+        anchor_x = screen_x + point[0] * scale
+        anchor_y = screen_y + point[1] * scale
+
+        line_half_len = 120
+        half_plane_len = 140
+
+        p1 = (anchor_x + tangent_x * line_half_len, anchor_y + tangent_y * line_half_len)
+        p2 = (anchor_x - tangent_x * line_half_len, anchor_y - tangent_y * line_half_len)
+        p3 = (p2[0] + normal_x * half_plane_len, p2[1] + normal_y * half_plane_len)
+        p4 = (p1[0] + normal_x * half_plane_len, p1[1] + normal_y * half_plane_len)
+
+        pygame.draw.polygon(overlay, normal_color, [p1, p2, p3, p4])
+        pygame.draw.line(surface, line_color, (int(p1[0]), int(p1[1])), (int(p2[0]), int(p2[1])), 2)
+
+        arrow_end = (anchor_x + normal_x * 20, anchor_y + normal_y * 20)
+        pygame.draw.line(surface, (120, 0, 200), (int(anchor_x), int(anchor_y)), (int(arrow_end[0]), int(arrow_end[1])), 2)
+
+    surface.blit(overlay, (0, 0))
+
+def draw_orca_stats(surface, circle, camera_x, camera_y, font, color=(30, 30, 30)):
+    """Draw ORCA diagnostic stats for stuck investigation."""
+    stats = circle.get("debug_orca_stats")
+    if not stats or font is None:
+        return
+
+    screen_x, screen_y = world_to_screen(circle["x"], circle["y"], camera_x, camera_y)
+    lines = [
+        f"N {stats.get('neighbors', 0)} / C {stats.get('constraints', 0)}",
+        f"V {stats.get('new_speed', 0.0):.1f} / P {stats.get('pref_speed', 0.0):.1f}",
+        f"COL {int(stats.get('collision_pred', False))}",
+        f"Dmin {stats.get('nearest_dist', 0.0):.1f}",
+        f"Tdist {stats.get('target_dist', 0.0):.1f}",
+        f"Drop {stats.get('filtered_neighbors', 0)}",
+    ]
+
+    for i, text in enumerate(lines):
+        label_surface = font.render(text, True, color)
+        label_rect = label_surface.get_rect(center=(int(screen_x), int(screen_y + 75 + i * 16)))
+        surface.blit(label_surface, label_rect)
 
 def world_to_screen(world_x, world_y, camera_x, camera_y):
     """Convert world coordinates to screen coordinates"""
@@ -203,6 +459,8 @@ while running:
                     for circle in selected_circles:
                         circle["target_x"] = world_x
                         circle["target_y"] = world_y
+                        circle["target_radius"] = 0.0
+                        circle["target_ref"] = None
                         circle["arrival_threshold"] = 5  # Precise arrival
                         
         elif event.type == pygame.MOUSEBUTTONUP:
@@ -286,6 +544,8 @@ while running:
                                 continue
                             circle["target_x"] = target_unit["x"]
                             circle["target_y"] = target_unit["y"]
+                            circle["target_radius"] = target_unit["radius"]
+                            circle["target_ref"] = target_unit
                             # Arrive when touching (Radius + Radius + Margin)
                             # 这样可以实现多个单位围住一个目标
                             circle["arrival_threshold"] = circle["radius"] + target_unit["radius"] + 5
@@ -295,6 +555,10 @@ while running:
                 avoidance_manager.next_algorithm()
                 current_algo = avoidance_manager.get_algorithm()
                 print(f"Switched to: {current_algo.get_name() if current_algo else 'None'}")
+            if event.key == pygame.K_d:
+                # Toggle debug visuals
+                avoidance_config.DEBUG_ENABLED = not avoidance_config.DEBUG_ENABLED
+                print(f"Debug enabled: {avoidance_config.DEBUG_ENABLED}")
     
     # Keyboard input - WASD camera movement
     keys = pygame.key.get_pressed()
@@ -318,6 +582,12 @@ while running:
     
     # Draw grid
     draw_grid(screen, camera_x, camera_y)
+
+    # Draw FPS
+    fps = clock.get_fps()
+    fps_surface = small_font.render(f"FPS: {fps:.1f}", True, (0, 0, 0))
+    fps_rect = fps_surface.get_rect(topright=(WINDOW_WIDTH - 10, 10))
+    screen.blit(fps_surface, fps_rect)
     
     # Draw all circles
     for circle in circles:
@@ -359,6 +629,29 @@ while running:
                                (int(target_screen_x + 5), int(target_screen_y - 5)),
                                (int(target_screen_x - 5), int(target_screen_y + 5)), 1)
 
+                reachable_target = circle.get("debug_reachable_target")
+                if avoidance_config.DEBUG_ENABLED and reachable_target:
+                    reach_screen_x, reach_screen_y = world_to_screen(
+                        reachable_target[0], reachable_target[1], camera_x, camera_y
+                    )
+                    pygame.draw.circle(screen, (255, 140, 0), (int(reach_screen_x), int(reach_screen_y)), 6, 2)
+                    pygame.draw.line(screen, (255, 140, 0),
+                                   (int(reach_screen_x - 4), int(reach_screen_y)),
+                                   (int(reach_screen_x + 4), int(reach_screen_y)), 2)
+                    pygame.draw.line(screen, (255, 140, 0),
+                                   (int(reach_screen_x), int(reach_screen_y - 4)),
+                                   (int(reach_screen_x), int(reach_screen_y + 4)), 2)
+
+            # Draw feasible angles and velocity direction for selected circles
+            if avoidance_config.DEBUG_ENABLED and circle in selected_circles:
+                draw_allowed_angles(screen, circle, camera_x, camera_y)
+                draw_velocity_direction(screen, circle, camera_x, camera_y)
+                draw_minkowski_circles(screen, circle, camera_x, camera_y)
+                draw_reverse_cooldown(screen, circle, camera_x, camera_y, small_font)
+                draw_orca_debug(screen, circle, camera_x, camera_y, small_font)
+                draw_orca_constraints(screen, circle, camera_x, camera_y)
+                draw_orca_stats(screen, circle, camera_x, camera_y, small_font)
+
     # Draw global target (Z key)
     if global_target:
         gt_screen_x, gt_screen_y = world_to_screen(global_target[0], global_target[1], camera_x, camera_y)
@@ -396,12 +689,14 @@ while running:
         " [Right Click] Move Here (Precise)",
         " [Z] Attack/Follow Unit (Touch)",
         " [TAB] Switch Algorithm",
+    " [D] Toggle Debug",
         " [WASD] Camera",
         "",
         f"Camera: ({camera_x}, {camera_y})",
         f"Circles: {len(circles)}",
         f"Selected: {len(selected_circles)}",
-        f"Algorithm: {avoidance_manager.get_algorithm().get_name() if avoidance_manager.get_algorithm() else 'None'}"
+        f"Algorithm: {avoidance_manager.get_algorithm().get_name() if avoidance_manager.get_algorithm() else 'None'}",
+        f"Debug: {avoidance_config.DEBUG_ENABLED}",
     ]
     
     y_offset = 10

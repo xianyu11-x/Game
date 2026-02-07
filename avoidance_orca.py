@@ -4,6 +4,7 @@ Provides smooth and efficient collision avoidance using velocity obstacles
 """
 
 from avoidance_base import AvoidanceBase
+from avoidance_config import normalize_angle, angular_distance
 import math
 
 class ORCAAvoidance(AvoidanceBase):
@@ -21,6 +22,28 @@ class ORCAAvoidance(AvoidanceBase):
         self.min_speed = 15.0  # 适中的最小速度
         self.escape_mode_speed = 50.0  # 逃离模式的速度
         self.circle_id_map = {}  # 用于跟踪每个圆形的状态
+        # 方向惩罚与抑制（与 Predictive Scan 对齐的策略）
+        self.turn_penalty_weight = 0.0
+        self.turn_penalty_threshold_deg = 45.0
+        self.opposite_suppression_enabled = True
+        self.opposite_angle_threshold_deg = 30.0
+        # Reverse cooldown（避免频繁反向）
+        self.reverse_cooldown_enabled = True
+        self.reverse_cooldown_base = 0.4
+        self.reverse_cooldown_max = 5.0
+        self.reverse_cooldown_growth = 2.0
+        self.reverse_cooldown_decay = 0.8
+        self.reverse_extreme_threshold_deg = 120.0
+        # Concave detection（卡住时动态加大预测时间）
+        self.concave_detection_enabled = True
+        self.concave_progress_epsilon = 1.5
+        self.concave_time_growth = 0.6
+        self.concave_time_max = 4.0
+        self.concave_decay = 0.8
+        # Velocity inertia (smooth oscillation)
+        self.inertia_enabled = True
+        self.inertia_weight = 0.7  # 0~1, higher keeps more of previous velocity
+        self.inertia_min_speed = 5.0
     
     def _calculate_preferred_velocity(self, circle, target_x, target_y):
         """Calculate the preferred velocity towards the target"""
@@ -39,9 +62,12 @@ class ORCAAvoidance(AvoidanceBase):
         """Get nearby neighbors sorted by urgency (distance and relative velocity)"""
         neighbors = []
         circle_vel = self._get_velocity(circle)
+        target_ref = circle.get("target_ref")
         
         for other in all_circles:
             if other is circle:
+                continue
+            if target_ref is not None and other is target_ref:
                 continue
             
             dx = other["x"] - circle["x"]
@@ -52,11 +78,13 @@ class ORCAAvoidance(AvoidanceBase):
             if dist < self.neighbor_dist:
                 # Calculate urgency: closer and approaching neighbors are more urgent
                 other_vel = self._get_velocity(other)
-                rel_vel_x = circle_vel[0] - other_vel[0]
-                rel_vel_y = circle_vel[1] - other_vel[1]
+                rel_vel_x = other_vel[0] - circle_vel[0]
+                rel_vel_y = other_vel[1] - circle_vel[1]
                 
                 # Dot product: negative means approaching
                 approach_rate = (dx * rel_vel_x + dy * rel_vel_y) / (dist + 0.01)
+                if approach_rate >= 0:
+                    continue
                 
                 # Urgency score: combine distance and approach rate
                 # Lower score = more urgent
@@ -68,7 +96,7 @@ class ORCAAvoidance(AvoidanceBase):
         neighbors.sort(key=lambda x: x[0])
         return [n[1] for n in neighbors[:self.max_neighbors]]
     
-    def _compute_orca_line(self, circle, neighbor, delta_time):
+    def _compute_orca_line(self, circle, neighbor, delta_time, time_horizon):
         """Compute the ORCA line for a neighbor"""
         # Relative position
         rel_pos = (neighbor["x"] - circle["x"], neighbor["y"] - circle["y"])
@@ -77,6 +105,9 @@ class ORCAAvoidance(AvoidanceBase):
         circle_vel = self._get_velocity(circle)
         neighbor_vel = self._get_velocity(neighbor)
         rel_vel = (circle_vel[0] - neighbor_vel[0], circle_vel[1] - neighbor_vel[1])
+        neighbor_stationary = (
+            abs(neighbor_vel[0]) < 1e-6 and abs(neighbor_vel[1]) < 1e-6
+        )
         
         # Combined radius (适度的安全边距)
         safety_margin = 1.5  # 适中的安全边距,避免碰撞但不过度保守
@@ -96,8 +127,10 @@ class ORCAAvoidance(AvoidanceBase):
             }
         
         # ORCA computation
-        w = (rel_vel[0] - rel_pos[0] / self.time_horizon,
-             rel_vel[1] - rel_pos[1] / self.time_horizon)
+        w = (
+            rel_vel[0] - rel_pos[0] / time_horizon,
+            rel_vel[1] - rel_pos[1] / time_horizon,
+        )
         
         # Check if collision is imminent
         w_length_sq = w[0]**2 + w[1]**2
@@ -115,11 +148,13 @@ class ORCAAvoidance(AvoidanceBase):
             line_direction = (unit_w[1], -unit_w[0])
             
             # ORCA line passes through u
-            u = (w[0] * 0.5, w[1] * 0.5)
+            scale = 1.0 if neighbor_stationary else 0.5
+            u = (w[0] * scale, w[1] * scale)
             
             return {
                 'point': u,
-                'direction': line_direction
+                'direction': line_direction,
+                'stationary': neighbor_stationary,
             }
         else:
             # Collision will occur
@@ -152,11 +187,13 @@ class ORCAAvoidance(AvoidanceBase):
                 else:
                     line_direction = (leg_direction2[1], -leg_direction2[0])
                 
-                u = (w[0] * 0.5, w[1] * 0.5)
+                scale = 1.0 if neighbor_stationary else 0.5
+                u = (w[0] * scale, w[1] * scale)
                 
                 return {
                     'point': u,
-                    'direction': line_direction
+                    'direction': line_direction,
+                    'stationary': neighbor_stationary,
                 }
             else:
                 # Already colliding, push directly away
@@ -170,11 +207,13 @@ class ORCAAvoidance(AvoidanceBase):
                 
                 unit_w = (w[0] / w_length, w[1] / w_length)
                 line_direction = (unit_w[1], -unit_w[0])
-                u = (w[0] * 0.5, w[1] * 0.5)
+                scale = 1.0 if neighbor_stationary else 0.5
+                u = (w[0] * scale, w[1] * scale)
                 
                 return {
                     'point': u,
-                    'direction': line_direction
+                    'direction': line_direction,
+                    'stationary': neighbor_stationary,
                 }
     
     def _linear_program(self, orca_lines, pref_velocity, circle):
@@ -275,6 +314,10 @@ class ORCAAvoidance(AvoidanceBase):
     
     def _get_velocity(self, circle):
         """Get current velocity from circle's angle and speed"""
+        if circle.get("target_x") is None or circle.get("target_y") is None:
+            return (0.0, 0.0)
+        if circle.get("speed", 0.0) <= 0.01:
+            return (0.0, 0.0)
         angle_rad = math.radians(circle["angle"])
         # Note: In many systems, 0 degrees points right and increases counter-clockwise
         return (
@@ -296,127 +339,207 @@ class ORCAAvoidance(AvoidanceBase):
         
         return (new_x, new_y, new_angle)
     
-    def _calculate_escape_velocity(self, circle, neighbors, pref_velocity):
-        """
-        当被包围时,计算逃离速度
-        策略: 找到最稀疏的方向逃离
-        """
-        if not neighbors:
+    def _angle_to_target(self, circle, target_x, target_y):
+        dx = target_x - circle["x"]
+        dy = target_y - circle["y"]
+        return normalize_angle(math.degrees(math.atan2(dy, dx)))
+
+    def _get_time_horizon(self, circle, target_x, target_y, delta_time):
+        base_time = self.time_horizon
+        if not self.concave_detection_enabled:
+            return base_time
+
+        current_distance = math.hypot(target_x - circle["x"], target_y - circle["y"])
+        last_distance = circle.get("concave_last_distance")
+        stuck_timer = circle.get("concave_timer", 0.0)
+        epsilon = self.concave_progress_epsilon
+
+        if last_distance is None:
+            circle["concave_last_distance"] = current_distance
+            return base_time
+
+        if current_distance < last_distance - epsilon:
+            stuck_timer = max(0.0, stuck_timer - self.concave_decay * delta_time)
+        else:
+            stuck_timer += delta_time
+
+        circle["concave_last_distance"] = current_distance
+        circle["concave_timer"] = stuck_timer
+
+        growth = self.concave_time_growth
+        max_time = self.concave_time_max
+        return min(base_time * (1.0 + stuck_timer * growth), max_time)
+
+    def _adjust_preferred_velocity(self, circle, pref_velocity):
+        pref_speed = math.hypot(pref_velocity[0], pref_velocity[1])
+        if pref_speed < 1e-6:
             return pref_velocity
-        
-        # 计算8个候选方向
-        num_directions = 16
-        best_direction = None
-        best_score = -float('inf')
-        
-        for i in range(num_directions):
-            angle = i * 360.0 / num_directions
-            angle_rad = math.radians(angle)
-            dir_x = math.cos(angle_rad)
-            dir_y = math.sin(angle_rad)
-            
-            # 评分标准:
-            # 1. 方向上最近障碍物的距离(越远越好)
-            # 2. 方向上障碍物的数量(越少越好)
-            # 3. 与目标方向的接近程度(bonus)
-            
-            min_dist_in_direction = float('inf')
-            obstacles_in_direction = 0
-            
-            for neighbor in neighbors:
-                # 计算邻居相对位置
-                to_neighbor_x = neighbor["x"] - circle["x"]
-                to_neighbor_y = neighbor["y"] - circle["y"]
-                dist_to_neighbor = math.sqrt(to_neighbor_x**2 + to_neighbor_y**2)
-                
-                if dist_to_neighbor > 0.01:
-                    # 检查邻居是否在这个方向上
-                    to_neighbor_x /= dist_to_neighbor
-                    to_neighbor_y /= dist_to_neighbor
-                    
-                    dot = dir_x * to_neighbor_x + dir_y * to_neighbor_y
-                    
-                    # 如果在这个方向的前方(夹角<90度)
-                    if dot > 0.3:  # 约70度范围内
-                        obstacles_in_direction += 1
-                        min_dist_in_direction = min(min_dist_in_direction, dist_to_neighbor)
-            
-            # 计算得分
-            if min_dist_in_direction == float('inf'):
-                min_dist_in_direction = 1000  # 这个方向没有障碍物,很好
-            
-            # 距离分数(距离越远越好)
-            distance_score = min_dist_in_direction
-            
-            # 障碍物数量分数(越少越好)
-            obstacle_score = -obstacles_in_direction * 20
-            
-            # 目标方向分数(与目标方向接近有bonus)
-            pref_magnitude = math.sqrt(pref_velocity[0]**2 + pref_velocity[1]**2)
-            if pref_magnitude > 0.01:
-                pref_dir_x = pref_velocity[0] / pref_magnitude
-                pref_dir_y = pref_velocity[1] / pref_magnitude
-                target_alignment = (dir_x * pref_dir_x + dir_y * pref_dir_y) * 10
-            else:
-                target_alignment = 0
-            
-            total_score = distance_score + obstacle_score + target_alignment
-            
-            if total_score > best_score:
-                best_score = total_score
-                best_direction = (dir_x, dir_y)
-        
-        if best_direction is None:
-            return pref_velocity
-        
-        # 使用逃离速度
-        escape_speed = self.escape_mode_speed
-        return (best_direction[0] * escape_speed, best_direction[1] * escape_speed)
+
+        current_angle = circle["angle"]
+        pref_angle = math.degrees(math.atan2(pref_velocity[1], pref_velocity[0]))
+
+        # Turn penalty: bias towards current direction when the turn is large
+        if self.turn_penalty_weight > 0.0:
+            diff = angular_distance(pref_angle, current_angle)
+            if diff > self.turn_penalty_threshold_deg:
+                denom = max(1e-6, 180.0 - self.turn_penalty_threshold_deg)
+                normalized = (diff - self.turn_penalty_threshold_deg) / denom
+                blend = min(1.0, normalized * self.turn_penalty_weight)
+                pref_dir = (pref_velocity[0] / pref_speed, pref_velocity[1] / pref_speed)
+                current_dir = (
+                    math.cos(math.radians(current_angle)),
+                    math.sin(math.radians(current_angle)),
+                )
+                blended = (
+                    pref_dir[0] * (1.0 - blend) + current_dir[0] * blend,
+                    pref_dir[1] * (1.0 - blend) + current_dir[1] * blend,
+                )
+                blended_len = math.hypot(blended[0], blended[1])
+                if blended_len > 1e-6:
+                    pref_velocity = (
+                        blended[0] / blended_len * pref_speed,
+                        blended[1] / blended_len * pref_speed,
+                    )
+                    pref_angle = math.degrees(math.atan2(pref_velocity[1], pref_velocity[0]))
+
+        # Opposite suppression when cooldown is active
+        if self.opposite_suppression_enabled:
+            opposite_dir = normalize_angle(current_angle + 180.0)
+            if angular_distance(pref_angle, opposite_dir) <= self.opposite_angle_threshold_deg:
+                if self.reverse_cooldown_enabled and circle.get("reverse_cooldown", 0.0) > 0.0:
+                    current_dir = (
+                        math.cos(math.radians(current_angle)),
+                        math.sin(math.radians(current_angle)),
+                    )
+                    pref_velocity = (current_dir[0] * pref_speed, current_dir[1] * pref_speed)
+
+        return pref_velocity
+
+    def _update_reverse_cooldown(self, circle, selected_angle, target_angle, delta_time):
+        if not self.reverse_cooldown_enabled:
+            return
+
+        base = self.reverse_cooldown_base
+        growth = self.reverse_cooldown_growth
+        decay = self.reverse_cooldown_decay
+        max_cooldown = self.reverse_cooldown_max
+        extreme_threshold = self.reverse_extreme_threshold_deg
+
+        cooldown = circle.get("reverse_cooldown", 0.0)
+        extreme_count = circle.get("reverse_extreme_count", 0)
+
+        if angular_distance(selected_angle, target_angle) >= extreme_threshold:
+            extreme_count += 1
+            cooldown = max(cooldown, min(base * (growth ** (extreme_count - 1)), max_cooldown))
+        else:
+            extreme_count = max(0, extreme_count - 1)
+            cooldown = max(0.0, cooldown - decay * delta_time)
+
+        circle["reverse_cooldown"] = cooldown
+        circle["reverse_extreme_count"] = extreme_count
     
     def calculate_avoidance(self, circle, target_x, target_y, all_circles, delta_time):
         """Calculate avoidance using ORCA algorithm with smart escape strategy"""
         # Get circle ID for tracking
         circle_id = circle.get("label", id(circle))
+
+        if target_x is None or target_y is None:
+            circle["debug_orca_pref_velocity"] = None
+            circle["debug_orca_new_velocity"] = None
+            circle["debug_orca_lines"] = []
+            circle["debug_orca_stats"] = {
+                "neighbors": 0,
+                "constraints": 0,
+                "pref_speed": 0.0,
+                "new_speed": 0.0,
+                "collision_pred": False,
+            }
+            circle["debug_orca_time_horizon"] = None
+            circle["debug_orca_neighbor_dist"] = self.neighbor_dist
+            circle["debug_orca_velocity_scale"] = 0.5
+            circle["debug_detection_radius"] = self.neighbor_dist
+            circle["orca_last_velocity"] = (0.0, 0.0)
+            return self._apply_velocity(circle, self._get_velocity(circle), delta_time)
+
+        last_target = circle.get("reverse_last_target")
+        current_target = (target_x, target_y)
+        if last_target is None or last_target != current_target:
+            circle["reverse_cooldown"] = 0.0
+            circle["reverse_extreme_count"] = 0
+            circle["concave_timer"] = 0.0
+            circle["concave_last_distance"] = None
+            circle["reverse_last_target"] = current_target
+
+        target_angle = self._angle_to_target(circle, target_x, target_y)
+        time_horizon = self._get_time_horizon(circle, target_x, target_y, delta_time)
+        circle["debug_orca_time_horizon"] = time_horizon
+        circle["debug_orca_neighbor_dist"] = self.neighbor_dist
+        circle["debug_orca_velocity_scale"] = 0.5
+        circle["debug_detection_radius"] = self.neighbor_dist
         
         # Calculate preferred velocity (towards target)
         pref_velocity = self._calculate_preferred_velocity(circle, target_x, target_y)
+        pref_velocity = self._adjust_preferred_velocity(circle, pref_velocity)
+        circle["debug_orca_pref_velocity"] = pref_velocity
         
         # Get nearby neighbors
         neighbors = self._get_neighbors(circle, all_circles)
+        nearest_dist = None
+        total_neighbors = 0
+        for other in all_circles:
+            if other is circle:
+                continue
+            if circle.get("target_ref") is not None and other is circle.get("target_ref"):
+                continue
+            total_neighbors += 1
+            dist = math.hypot(other["x"] - circle["x"], other["y"] - circle["y"])
+            if nearest_dist is None or dist < nearest_dist:
+                nearest_dist = dist
         
         if not neighbors:
             # No neighbors, move directly towards target
             return self._apply_velocity(circle, pref_velocity, delta_time)
         
-        # 检查是否被严重包围
-        close_neighbors = [n for n in neighbors 
-                          if math.sqrt((n["x"]-circle["x"])**2 + (n["y"]-circle["y"])**2) 
-                          < (circle["radius"] + n["radius"]) * 2.5]
-        
-        is_surrounded = len(close_neighbors) >= 3
-        
-        # 如果被包围,使用逃离策略
-        if is_surrounded:
-            escape_velocity = self._calculate_escape_velocity(circle, close_neighbors, pref_velocity)
-            if escape_velocity:
-                return self._apply_velocity(circle, escape_velocity, delta_time)
-        
         # 标准ORCA计算
         orca_lines = []
         for neighbor in neighbors:
-            line = self._compute_orca_line(circle, neighbor, delta_time)
+            line = self._compute_orca_line(circle, neighbor, delta_time, time_horizon)
             if line:
                 orca_lines.append(line)
         
         # Find optimal velocity using linear programming
         new_velocity = self._linear_program(orca_lines, pref_velocity, circle)
-        
-        # 检查速度是否过小
-        vel_magnitude = math.sqrt(new_velocity[0]**2 + new_velocity[1]**2)
-        
-        if vel_magnitude < self.min_speed * 0.5:
-            # 速度太小,尝试切线运动
-            new_velocity = self._get_tangential_velocity(circle, neighbors, pref_velocity)
+        circle["debug_orca_new_velocity"] = new_velocity
+        circle["debug_orca_lines"] = orca_lines
+        circle["debug_orca_stats"] = {
+            "neighbors": len(neighbors),
+            "constraints": len(orca_lines),
+            "pref_speed": math.hypot(pref_velocity[0], pref_velocity[1]),
+            "new_speed": math.hypot(new_velocity[0], new_velocity[1]),
+            "collision_pred": False,
+            "nearest_dist": nearest_dist,
+            "target_dist": math.hypot(target_x - circle["x"], target_y - circle["y"]),
+            "filtered_neighbors": max(0, total_neighbors - len(neighbors)),
+        }
+
+        if self.inertia_enabled:
+            last_velocity = circle.get("orca_last_velocity", (0.0, 0.0))
+            last_speed = math.hypot(last_velocity[0], last_velocity[1])
+            new_speed = math.hypot(new_velocity[0], new_velocity[1])
+            if last_speed > self.inertia_min_speed and new_speed > 1e-6:
+                blend = max(0.0, min(1.0, self.inertia_weight))
+                blended = (
+                    new_velocity[0] * (1.0 - blend) + last_velocity[0] * blend,
+                    new_velocity[1] * (1.0 - blend) + last_velocity[1] * blend,
+                )
+                blended_speed = math.hypot(blended[0], blended[1])
+                max_speed = min(circle["speed"], self.max_speed)
+                if blended_speed > max_speed:
+                    scale = max_speed / blended_speed
+                    blended = (blended[0] * scale, blended[1] * scale)
+                new_velocity = blended
+                circle["debug_orca_new_velocity"] = new_velocity
+                circle["debug_orca_stats"]["new_speed"] = math.hypot(new_velocity[0], new_velocity[1])
         
         # 碰撞预检测 - 使用严格的检测避免穿透
         test_result = self._apply_velocity(circle, new_velocity, delta_time)
@@ -433,62 +556,12 @@ class ORCAAvoidance(AvoidanceBase):
                 break
         
         if will_collide:
-            # 如果会碰撞,使用切线运动
-            new_velocity = self._get_tangential_velocity(circle, neighbors, pref_velocity)
+            # 如果会碰撞,保持线性规划结果
             test_result = self._apply_velocity(circle, new_velocity, delta_time)
-        
+            circle["debug_orca_stats"]["collision_pred"] = True
+
+        _, _, new_angle = test_result
+        circle["orca_last_velocity"] = new_velocity
+        self._update_reverse_cooldown(circle, new_angle, target_angle, delta_time)
         return test_result
     
-    def _get_tangential_velocity(self, circle, neighbors, pref_velocity):
-        """
-        当直线路径被阻挡时,尝试切线运动
-        简化版本: 找到最近障碍物,沿其切线移动
-        """
-        if not neighbors:
-            return pref_velocity
-        
-        # 找最近的邻居
-        nearest = None
-        min_dist = float('inf')
-        for neighbor in neighbors:
-            dx = neighbor["x"] - circle["x"]
-            dy = neighbor["y"] - circle["y"]
-            dist = math.sqrt(dx**2 + dy**2)
-            if dist < min_dist:
-                min_dist = dist
-                nearest = neighbor
-        
-        if nearest is None:
-            return pref_velocity
-        
-        # 计算到障碍物的向量
-        to_obstacle_x = nearest["x"] - circle["x"]
-        to_obstacle_y = nearest["y"] - circle["y"]
-        dist = math.sqrt(to_obstacle_x**2 + to_obstacle_y**2)
-        
-        if dist < 0.01:
-            return pref_velocity
-        
-        to_obstacle_x /= dist
-        to_obstacle_y /= dist
-        
-        # 计算两个切线方向(垂直于障碍物方向)
-        tangent1 = (-to_obstacle_y, to_obstacle_x)
-        tangent2 = (to_obstacle_y, -to_obstacle_x)
-        
-        # 计算目标方向
-        pref_magnitude = math.sqrt(pref_velocity[0]**2 + pref_velocity[1]**2)
-        if pref_magnitude > 0.01:
-            pref_dir = (pref_velocity[0] / pref_magnitude, pref_velocity[1] / pref_magnitude)
-        else:
-            pref_dir = (1, 0)
-        
-        # 选择更接近目标方向的切线
-        dot1 = tangent1[0] * pref_dir[0] + tangent1[1] * pref_dir[1]
-        dot2 = tangent2[0] * pref_dir[0] + tangent2[1] * pref_dir[1]
-        
-        best_tangent = tangent1 if dot1 > dot2 else tangent2
-        
-        # 使用适中的速度
-        speed = circle["speed"] * 0.7
-        return (best_tangent[0] * speed, best_tangent[1] * speed)

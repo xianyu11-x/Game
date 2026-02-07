@@ -7,6 +7,8 @@ import os
 import sys
 import importlib.util
 
+from avoidance_config import DEFAULT_AVOIDANCE_ALGORITHM
+
 class AvoidanceManager:
     """Manages loading and switching between avoidance algorithms"""
     
@@ -27,7 +29,8 @@ class AvoidanceManager:
         
         # Set default algorithm if available
         if self.algorithms and not self.current_algorithm:
-            self.current_algorithm = list(self.algorithms.values())[0]
+            preferred = self.algorithms.get(DEFAULT_AVOIDANCE_ALGORITHM)
+            self.current_algorithm = preferred or list(self.algorithms.values())[0]
         
         return len(self.algorithms)
     
