@@ -2,6 +2,7 @@ import pygame
 import sys
 import math
 import avoidance_config
+from avoidance_config import AVOIDANCE_CONFIG
 from avoidance_manager import AvoidanceManager
 
 # Initialize Pygame
@@ -33,6 +34,8 @@ selected_circles = []  # Changed to list
 global_target = None   # (x, y)
 is_dragging = False
 drag_start_pos = (0, 0)
+obstacles = []  # Each: {"cx": cx, "cy": cy, "w": w, "h": h, "angle": 0}
+obstacle_placement_mode = False
 
 # Initialize avoidance manager
 avoidance_manager = AvoidanceManager()
@@ -387,6 +390,234 @@ def draw_orca_constraints(surface, circle, camera_x, camera_y,
 
     surface.blit(overlay, (0, 0))
 
+def _clip_segment_to_circle_vis(x1, y1, x2, y2, cx, cy, r):
+    """Return the portion of segment (x1,y1)→(x2,y2) inside circle (cx,cy,r).
+    Returns (px1, py1, px2, py2) or None."""
+    dx, dy = x2 - x1, y2 - y1
+    fx, fy = x1 - cx, y1 - cy
+    a = dx * dx + dy * dy
+    if a < 1e-12:
+        if fx * fx + fy * fy <= r * r:
+            return (x1, y1, x2, y2)
+        return None
+    b = 2.0 * (fx * dx + fy * dy)
+    c = fx * fx + fy * fy - r * r
+    disc = b * b - 4.0 * a * c
+    if disc < 0:
+        return None
+    sd = math.sqrt(disc)
+    t1 = (-b - sd) / (2.0 * a)
+    t2 = (-b + sd) / (2.0 * a)
+    t_lo = max(0.0, t1)
+    t_hi = min(1.0, t2)
+    if t_lo > t_hi + 1e-9:
+        return None
+    return (x1 + t_lo * dx, y1 + t_lo * dy,
+            x1 + t_hi * dx, y1 + t_hi * dy)
+
+
+def draw_obstacle_detection(surface, circle, camera_x, camera_y, obstacles_list):
+    """Draw obstacle detection zones using 4-segments + 4-circles decomposition.
+    
+    Visualises:
+      - Rounded-rectangle outline (light blue)
+      - Detection radius circle (dashed cyan)
+      - Clipped edge segments within detection radius (green lines)
+      - Corner circles within detection radius (yellow circles)
+      - Blocked angle sector (red wedge) — matching the algorithm
+    """
+    if not obstacles_list:
+        return
+
+    config = AVOIDANCE_CONFIG.get("predictive_scan", {})
+    expand = circle["radius"] + config.get("collision_padding", 2.0)
+
+    # Use the detection radius already computed by the avoidance algorithm
+    det_r = circle.get("debug_detection_radius")
+    if not det_r:
+        return
+
+    ax, ay = circle["x"], circle["y"]
+    scx, scy = world_to_screen(ax, ay, camera_x, camera_y)
+
+    overlay = pygame.Surface((WINDOW_WIDTH, WINDOW_HEIGHT), pygame.SRCALPHA)
+
+    # Draw detection radius circle
+    pygame.draw.circle(overlay, (0, 180, 255, 80), (int(scx), int(scy)), int(det_r), 1)
+
+    for obs in obstacles_list:
+        hw, hh = obs["w"] / 2, obs["h"] / 2
+
+        # Quick distance check (local space)
+        neg_rad = math.radians(-obs["angle"])
+        cos_n = math.cos(neg_rad)
+        sin_n = math.sin(neg_rad)
+        ddx = ax - obs["cx"]
+        ddy = ay - obs["cy"]
+        lx = ddx * cos_n - ddy * sin_n
+        ly = ddx * sin_n + ddy * cos_n
+
+        cp_x = max(-hw, min(hw, lx))
+        cp_y = max(-hh, min(hh, ly))
+        if math.hypot(lx - cp_x, ly - cp_y) > det_r + expand:
+            continue
+
+        e = expand
+        obs_rad = math.radians(obs["angle"])
+        cos_o = math.cos(obs_rad)
+        sin_o = math.sin(obs_rad)
+
+        def to_world(plx, ply):
+            return (obs["cx"] + plx * cos_o - ply * sin_o,
+                    obs["cy"] + plx * sin_o + ply * cos_o)
+
+        def to_screen_local(plx, ply):
+            wx, wy = to_world(plx, ply)
+            return world_to_screen(wx, wy, camera_x, camera_y)
+
+        # --- Draw rounded rectangle outline (Minkowski sum) ---
+        arc_segments = 8
+        outline_pts = []
+        corner_signs = [(1, 1), (-1, 1), (-1, -1), (1, -1)]
+        arc_start_angles = [0, 90, 180, 270]
+        for ci in range(4):
+            sx_s, sy_s = corner_signs[ci]
+            cx_l = sx_s * hw
+            cy_l = sy_s * hh
+            sd = arc_start_angles[ci]
+            for j in range(arc_segments + 1):
+                a = math.radians(sd + 90.0 * j / arc_segments)
+                px = cx_l + e * math.cos(a)
+                py = cy_l + e * math.sin(a)
+                outline_pts.append(to_screen_local(px, py))
+        if len(outline_pts) >= 3:
+            int_pts = [(int(x), int(y)) for x, y in outline_pts]
+            pygame.draw.polygon(overlay, (0, 180, 255, 30), int_pts)
+            pygame.draw.polygon(overlay, (0, 180, 255, 100), int_pts, 1)
+
+        # --- 4 edge segments, clipped to detection circle ---
+        segs_local = [
+            ((-hw, -hh - e), ( hw, -hh - e)),   # bottom
+            (( hw + e, -hh), ( hw + e,  hh)),    # right
+            (( hw,  hh + e), (-hw,  hh + e)),    # top
+            ((-hw - e,  hh), (-hw - e, -hh)),    # left
+        ]
+        angles = []
+        for (sl1, sl2) in segs_local:
+            w1 = to_world(*sl1)
+            w2 = to_world(*sl2)
+            clipped = _clip_segment_to_circle_vis(
+                w1[0], w1[1], w2[0], w2[1], ax, ay, det_r)
+            if clipped is None:
+                continue
+            # Draw clipped segment (bright green)
+            cs1 = world_to_screen(clipped[0], clipped[1], camera_x, camera_y)
+            cs2 = world_to_screen(clipped[2], clipped[3], camera_x, camera_y)
+            pygame.draw.line(overlay, (0, 255, 100, 200),
+                             (int(cs1[0]), int(cs1[1])),
+                             (int(cs2[0]), int(cs2[1])), 3)
+            # Draw endpoint dots
+            pygame.draw.circle(overlay, (0, 255, 100, 255), (int(cs1[0]), int(cs1[1])), 3, 0)
+            pygame.draw.circle(overlay, (0, 255, 100, 255), (int(cs2[0]), int(cs2[1])), 3, 0)
+            # Collect angles
+            a1 = math.degrees(math.atan2(clipped[1] - ay, clipped[0] - ax))
+            a2 = math.degrees(math.atan2(clipped[3] - ay, clipped[2] - ax))
+            angles.append(((a1 + 180.0) % 360.0) - 180.0)
+            angles.append(((a2 + 180.0) % 360.0) - 180.0)
+
+        # --- 4 corner circles (static: no time sampling, single calculation) ---
+        prediction_time = config.get("prediction_time", 0.5)
+        self_speed = circle["speed"] * config.get("speed_factor", 1.0)
+        self_distance = self_speed * prediction_time
+        corner_blocked = []
+
+        corners = [(hw, hh), (-hw, hh), (-hw, -hh), (hw, -hh)]
+        for clx, cly in corners:
+            wc = to_world(clx, cly)
+            sc = world_to_screen(wc[0], wc[1], camera_x, camera_y)
+            p0x = wc[0] - ax
+            p0y = wc[1] - ay
+            base_dist = math.hypot(p0x, p0y)
+            if base_dist - e > det_r:
+                continue  # corner circle fully outside detection
+            # Draw corner circle (yellow)
+            pygame.draw.circle(overlay, (255, 220, 0, 120), (int(sc[0]), int(sc[1])), int(e), 1)
+            if base_dist <= e or base_dist < 1e-6:
+                continue
+            # Static obstacle: compute once with max self_distance
+            if self_distance <= 1e-6:
+                continue
+            if base_dist > self_distance + e:
+                continue
+            if base_dist < abs(self_distance - e):
+                continue
+            cos_half = (base_dist * base_dist + self_distance * self_distance - e * e) / (2.0 * base_dist * self_distance)
+            cos_half = max(-1.0, min(1.0, cos_half))
+            half_angle = math.degrees(math.acos(cos_half))
+            center_angle = math.degrees(math.atan2(p0y, p0x))
+            center_angle = ((center_angle + 180.0) % 360.0) - 180.0
+            cs = ((center_angle - half_angle + 180.0) % 360.0) - 180.0
+            ce = ((center_angle + half_angle + 180.0) % 360.0) - 180.0
+            if cs <= ce:
+                corner_blocked.append((cs, ce))
+            else:
+                corner_blocked.append((cs, 180.0))
+                corner_blocked.append((-180.0, ce))
+
+        # --- Combine edge angles + corner blocked intervals → draw blocked sector ---
+        # Edge segments → largest-gap → blocked interval
+        edge_blocked = []
+        if len(angles) >= 2:
+            angles.sort()
+            n = len(angles)
+            max_gap = -1.0
+            max_gap_idx = 0
+            for i in range(n):
+                g = (angles[(i + 1) % n] - angles[i]) if i < n - 1 else (angles[0] + 360.0) - angles[n - 1]
+                if g > max_gap:
+                    max_gap = g
+                    max_gap_idx = i
+            b_start = angles[(max_gap_idx + 1) % n]
+            b_end = angles[max_gap_idx]
+            if b_start <= b_end:
+                edge_blocked.append((b_start, b_end))
+            else:
+                edge_blocked.append((b_start, 180.0))
+                edge_blocked.append((-180.0, b_end))
+
+        # Merge edge + corner blocked intervals
+        all_blocked = edge_blocked + corner_blocked
+        if not all_blocked:
+            continue
+        all_blocked.sort()
+        merged = [all_blocked[0]]
+        for s, e_val in all_blocked[1:]:
+            ls, le = merged[-1]
+            if s <= le + 1e-6:
+                merged[-1] = (ls, max(le, e_val))
+            else:
+                merged.append((s, e_val))
+
+        # Draw all merged blocked sectors
+        wedge_radius = min(det_r, 120)
+        for b_start, b_end in merged:
+            pts = [(int(scx), int(scy))]
+            a = b_start
+            while a <= b_end:
+                ex = scx + wedge_radius * math.cos(math.radians(a))
+                ey = scy + wedge_radius * math.sin(math.radians(a))
+                pts.append((int(ex), int(ey)))
+                a += 3.0
+            ex = scx + wedge_radius * math.cos(math.radians(b_end))
+            ey = scy + wedge_radius * math.sin(math.radians(b_end))
+            pts.append((int(ex), int(ey)))
+            if len(pts) >= 3:
+                pygame.draw.polygon(overlay, (255, 50, 50, 45), pts)
+                pygame.draw.lines(overlay, (255, 50, 50, 120), True, pts, 1)
+
+    surface.blit(overlay, (0, 0))
+
+
 def draw_orca_stats(surface, circle, camera_x, camera_y, font, color=(30, 30, 30)):
     """Draw ORCA diagnostic stats for stuck investigation."""
     stats = circle.get("debug_orca_stats")
@@ -428,6 +659,132 @@ def get_circle_at_position(world_x, world_y, circles, radius=25):
             return circle
     return None
 
+def get_rotated_rect_corners(cx, cy, w, h, angle_deg):
+    """Get the 4 corners of a rotated rectangle in world coordinates."""
+    angle_rad = math.radians(angle_deg)
+    cos_a = math.cos(angle_rad)
+    sin_a = math.sin(angle_rad)
+    hw, hh = w / 2, h / 2
+    corners = [(-hw, -hh), (hw, -hh), (hw, hh), (-hw, hh)]
+    return [(cx + x * cos_a - y * sin_a, cy + x * sin_a + y * cos_a) for x, y in corners]
+
+def point_in_rotated_rect(px, py, cx, cy, w, h, angle_deg):
+    """Check if a point is inside a rotated rectangle."""
+    angle_rad = math.radians(-angle_deg)
+    cos_a = math.cos(angle_rad)
+    sin_a = math.sin(angle_rad)
+    dx = px - cx
+    dy = py - cy
+    local_x = dx * cos_a - dy * sin_a
+    local_y = dx * sin_a + dy * cos_a
+    return abs(local_x) <= w / 2 and abs(local_y) <= h / 2
+
+def get_obstacle_at_position(world_x, world_y):
+    """Find the obstacle at the given world position (newest first)."""
+    for obs in reversed(obstacles):
+        if point_in_rotated_rect(world_x, world_y, obs["cx"], obs["cy"], obs["w"], obs["h"], obs["angle"]):
+            return obs
+    return None
+
+def circle_overlaps_obstacle(cx, cy, radius, obs):
+    """Check if a circle overlaps with a rotated rectangle obstacle."""
+    angle_rad = math.radians(-obs["angle"])
+    cos_a = math.cos(angle_rad)
+    sin_a = math.sin(angle_rad)
+    dx = cx - obs["cx"]
+    dy = cy - obs["cy"]
+    local_x = dx * cos_a - dy * sin_a
+    local_y = dx * sin_a + dy * cos_a
+    hw, hh = obs["w"] / 2, obs["h"] / 2
+    closest_x = max(-hw, min(hw, local_x))
+    closest_y = max(-hh, min(hh, local_y))
+    diff_x = local_x - closest_x
+    diff_y = local_y - closest_y
+    return (diff_x * diff_x + diff_y * diff_y) < radius * radius
+
+def get_obstacle_push(circle, obstacles_list):
+    """Calculate push vector to resolve circle-obstacle collisions (hard constraint).
+    
+    Transforms the circle into each obstacle's local space, finds the closest
+    point on the rectangle, and pushes the circle out if overlapping.
+    
+    Uses radius + collision_padding so the circle centre always stays outside
+    the Minkowski sum used by the avoidance algorithm.
+    """
+    total_px, total_py = 0.0, 0.0
+    collision_padding = AVOIDANCE_CONFIG.get("predictive_scan", {}).get("collision_padding", 2.0)
+    effective_radius = circle["radius"] + collision_padding
+    
+    for obs in obstacles_list:
+        angle_rad = math.radians(-obs["angle"])
+        cos_a = math.cos(angle_rad)
+        sin_a = math.sin(angle_rad)
+        dx = circle["x"] - obs["cx"]
+        dy = circle["y"] - obs["cy"]
+        local_x = dx * cos_a - dy * sin_a
+        local_y = dx * sin_a + dy * cos_a
+        
+        hw, hh = obs["w"] / 2, obs["h"] / 2
+        closest_x = max(-hw, min(hw, local_x))
+        closest_y = max(-hh, min(hh, local_y))
+        
+        diff_x = local_x - closest_x
+        diff_y = local_y - closest_y
+        dist_sq = diff_x * diff_x + diff_y * diff_y
+        
+        if dist_sq >= effective_radius * effective_radius:
+            continue
+        
+        dist = math.sqrt(dist_sq) if dist_sq > 1e-12 else 0.0
+        
+        if dist > 1e-6:
+            # Circle center is outside the rectangle surface
+            overlap = effective_radius - dist
+            nx = diff_x / dist
+            ny = diff_y / dist
+        else:
+            # Circle center is inside the rectangle - push out via shortest axis
+            push_options = [
+                (hw - local_x, 1.0, 0.0),
+                (hw + local_x, -1.0, 0.0),
+                (hh - local_y, 0.0, 1.0),
+                (hh + local_y, 0.0, -1.0),
+            ]
+            min_push, nx, ny = min(push_options, key=lambda t: t[0])
+            overlap = min_push + effective_radius
+        
+        # Transform push direction back to world space
+        angle_back = math.radians(obs["angle"])
+        cos_b = math.cos(angle_back)
+        sin_b = math.sin(angle_back)
+        world_nx = nx * cos_b - ny * sin_b
+        world_ny = nx * sin_b + ny * cos_b
+        
+        total_px += world_nx * overlap
+        total_py += world_ny * overlap
+    
+    return total_px, total_py
+
+def draw_obstacles(surface, camera_x, camera_y):
+    """Draw all obstacles as rotated rectangles."""
+    if not obstacles:
+        return
+    overlay = pygame.Surface((WINDOW_WIDTH, WINDOW_HEIGHT), pygame.SRCALPHA)
+    for obs in obstacles:
+        corners = get_rotated_rect_corners(obs["cx"], obs["cy"], obs["w"], obs["h"], obs["angle"])
+        screen_corners = [world_to_screen(x, y, camera_x, camera_y) for x, y in corners]
+        int_corners = [(int(x), int(y)) for x, y in screen_corners]
+        pygame.draw.polygon(overlay, (100, 100, 100, 180), int_corners)
+        pygame.draw.polygon(overlay, (40, 40, 40, 255), int_corners, 2)
+        # Draw rotation indicator (small line from center pointing "up" in local space)
+        center_sx, center_sy = world_to_screen(obs["cx"], obs["cy"], camera_x, camera_y)
+        ind_len = min(obs["w"], obs["h"]) * 0.3
+        angle_rad = math.radians(obs["angle"])
+        ind_x = center_sx - math.sin(angle_rad) * ind_len
+        ind_y = center_sy + math.cos(angle_rad) * ind_len
+        pygame.draw.line(overlay, (200, 60, 60, 200), (int(center_sx), int(center_sy)), (int(ind_x), int(ind_y)), 2)
+    surface.blit(overlay, (0, 0))
+
 # Main game loop
 running = True
 while running:
@@ -443,18 +800,21 @@ while running:
                 drag_start_pos = pygame.mouse.get_pos()
             
             elif event.button == 3:  # Right click
-                # Move selected circles to mouse position (Precise Arrival)
-                if selected_circles:
+                if obstacle_placement_mode:
+                    # Rotate obstacle under cursor
+                    mouse_x, mouse_y = pygame.mouse.get_pos()
+                    world_x, world_y = screen_to_world(mouse_x, mouse_y, camera_x, camera_y)
+                    obs = get_obstacle_at_position(world_x, world_y)
+                    if obs:
+                        obs["angle"] = (obs["angle"] + 15) % 360
+                elif selected_circles:
+                    # Move selected circles to mouse position (Precise Arrival)
                     
                     # Clear global target marking (cancel Z-target)
                     global_target = None
                     
                     mouse_x, mouse_y = pygame.mouse.get_pos()
                     world_x, world_y = screen_to_world(mouse_x, mouse_y, camera_x, camera_y)
-                    
-                    # Store this just for visualization if needed, or just set targets
-                    # Note: We don't have a single "right_click_target" variable to draw, 
-                    # but we can set individual targets
                     
                     for circle in selected_circles:
                         circle["target_x"] = world_x
@@ -471,30 +831,50 @@ while running:
                 # Check distance to distinguish click vs drag
                 dist = math.hypot(drag_end_pos[0] - drag_start_pos[0], drag_end_pos[1] - drag_start_pos[1])
                 
-                if dist < 5:  # Click
-                    mouse_x, mouse_y = drag_end_pos
-                    world_x, world_y = screen_to_world(mouse_x, mouse_y, camera_x, camera_y)
-                    clicked_circle = get_circle_at_position(world_x, world_y, circles)
-                    
-                    if clicked_circle:
-                        selected_circles = [clicked_circle]  # Single select
+                if obstacle_placement_mode:
+                    # Obstacle placement mode
+                    if dist >= 10:  # Drag to create obstacle (minimum size)
+                        start_world = screen_to_world(drag_start_pos[0], drag_start_pos[1], camera_x, camera_y)
+                        end_world = screen_to_world(drag_end_pos[0], drag_end_pos[1], camera_x, camera_y)
+                        w = abs(end_world[0] - start_world[0])
+                        h = abs(end_world[1] - start_world[1])
+                        if w > 5 and h > 5:
+                            cx = (start_world[0] + end_world[0]) / 2
+                            cy = (start_world[1] + end_world[1]) / 2
+                            obstacles.append({"cx": cx, "cy": cy, "w": w, "h": h, "angle": 0})
                     else:
-                         selected_circles = [] # Deselect if clicking empty space
-
+                        # Click on obstacle to delete it
+                        mouse_x, mouse_y = drag_end_pos
+                        world_x, world_y = screen_to_world(mouse_x, mouse_y, camera_x, camera_y)
+                        obs = get_obstacle_at_position(world_x, world_y)
+                        if obs:
+                            obstacles.remove(obs)
                 else:
-                    # Drag selection - Box select
-                    start_world = screen_to_world(drag_start_pos[0], drag_start_pos[1], camera_x, camera_y)
-                    end_world = screen_to_world(drag_end_pos[0], drag_end_pos[1], camera_x, camera_y)
-                    
-                    left = min(start_world[0], end_world[0])
-                    right = max(start_world[0], end_world[0])
-                    top = min(start_world[1], end_world[1])
-                    bottom = max(start_world[1], end_world[1])
-                    
-                    selected_circles = []
-                    for circle in circles:
-                        if left < circle["x"] < right and top < circle["y"] < bottom:
-                            selected_circles.append(circle)
+                    # Normal selection mode
+                    if dist < 5:  # Click
+                        mouse_x, mouse_y = drag_end_pos
+                        world_x, world_y = screen_to_world(mouse_x, mouse_y, camera_x, camera_y)
+                        clicked_circle = get_circle_at_position(world_x, world_y, circles)
+                        
+                        if clicked_circle:
+                            selected_circles = [clicked_circle]  # Single select
+                        else:
+                             selected_circles = [] # Deselect if clicking empty space
+
+                    else:
+                        # Drag selection - Box select
+                        start_world = screen_to_world(drag_start_pos[0], drag_start_pos[1], camera_x, camera_y)
+                        end_world = screen_to_world(drag_end_pos[0], drag_end_pos[1], camera_x, camera_y)
+                        
+                        left = min(start_world[0], end_world[0])
+                        right = max(start_world[0], end_world[0])
+                        top = min(start_world[1], end_world[1])
+                        bottom = max(start_world[1], end_world[1])
+                        
+                        selected_circles = []
+                        for circle in circles:
+                            if left < circle["x"] < right and top < circle["y"] < bottom:
+                                selected_circles.append(circle)
         
         # Keyboard shortcuts
         if event.type == pygame.KEYDOWN:
@@ -523,6 +903,11 @@ while running:
                                      other["x"], other["y"], other["radius"]):
                         can_place = False
                         break
+                if can_place:
+                    for obs in obstacles:
+                        if circle_overlaps_obstacle(new_circle["x"], new_circle["y"], new_circle["radius"], obs):
+                            can_place = False
+                            break
                 
                 if can_place:
                     circles.append(new_circle)
@@ -555,10 +940,14 @@ while running:
                 avoidance_manager.next_algorithm()
                 current_algo = avoidance_manager.get_algorithm()
                 print(f"Switched to: {current_algo.get_name() if current_algo else 'None'}")
-            if event.key == pygame.K_d:
+            if event.key == pygame.K_v:
                 # Toggle debug visuals
                 avoidance_config.DEBUG_ENABLED = not avoidance_config.DEBUG_ENABLED
                 print(f"Debug enabled: {avoidance_config.DEBUG_ENABLED}")
+            if event.key == pygame.K_F3:
+                # Toggle obstacle placement mode
+                obstacle_placement_mode = not obstacle_placement_mode
+                print(f"Obstacle placement: {'ON' if obstacle_placement_mode else 'OFF'}")
     
     # Keyboard input - WASD camera movement
     keys = pygame.key.get_pressed()
@@ -574,14 +963,26 @@ while running:
     # Update circle movements
     delta_time = clock.get_time() / 1000.0  # Convert to seconds
     current_algorithm = avoidance_manager.get_algorithm()
+    # Pass obstacle data to avoidance algorithm (Minkowski blocking, no virtual circles)
+    if current_algorithm:
+        current_algorithm.set_obstacles(obstacles)
     for circle in circles:
         move_circle_towards_target(circle, delta_time, circles, current_algorithm)
+    # Apply obstacle hard collision for ALL circles (even stationary ones)
+    if obstacles:
+        for circle in circles:
+            obs_px, obs_py = get_obstacle_push(circle, obstacles)
+            circle["x"] += obs_px
+            circle["y"] += obs_py
     
     # Clear screen
     screen.fill(WHITE)
     
     # Draw grid
     draw_grid(screen, camera_x, camera_y)
+
+    # Draw obstacles
+    draw_obstacles(screen, camera_x, camera_y)
 
     # Draw FPS
     fps = clock.get_fps()
@@ -651,6 +1052,7 @@ while running:
                 draw_orca_debug(screen, circle, camera_x, camera_y, small_font)
                 draw_orca_constraints(screen, circle, camera_x, camera_y)
                 draw_orca_stats(screen, circle, camera_x, camera_y, small_font)
+                draw_obstacle_detection(screen, circle, camera_x, camera_y, obstacles)
 
     # Draw global target (Z key)
     if global_target:
@@ -664,7 +1066,7 @@ while running:
         target_label = font.render("Target (Z)", True, (255, 0, 255))
         screen.blit(target_label, (int(gt_screen_x) + 20, int(gt_screen_y) - 20))
 
-    # Draw drag selection box
+    # Draw drag selection box / obstacle preview
     if is_dragging:
         mouse_x, mouse_y = pygame.mouse.get_pos()
         rect_left = min(drag_start_pos[0], mouse_x)
@@ -672,14 +1074,23 @@ while running:
         rect_width = abs(drag_start_pos[0] - mouse_x)
         rect_height = abs(drag_start_pos[1] - mouse_y)
         
-        selection_rect = pygame.Rect(rect_left, rect_top, rect_width, rect_height)
-        pygame.draw.rect(screen, GREEN, selection_rect, 1) # Thin green border
-        
-        # Transparent fill
-        s = pygame.Surface((rect_width, rect_height))
-        s.set_alpha(50)
-        s.fill(GREEN)
-        screen.blit(s, (rect_left, rect_top))
+        if obstacle_placement_mode:
+            # Orange obstacle preview
+            if rect_width > 0 and rect_height > 0:
+                selection_rect = pygame.Rect(rect_left, rect_top, rect_width, rect_height)
+                pygame.draw.rect(screen, (200, 120, 50), selection_rect, 2)
+                s = pygame.Surface((rect_width, rect_height), pygame.SRCALPHA)
+                s.fill((200, 120, 50, 60))
+                screen.blit(s, (rect_left, rect_top))
+        else:
+            # Green selection box
+            selection_rect = pygame.Rect(rect_left, rect_top, rect_width, rect_height)
+            pygame.draw.rect(screen, GREEN, selection_rect, 1)
+            if rect_width > 0 and rect_height > 0:
+                s = pygame.Surface((rect_width, rect_height))
+                s.set_alpha(50)
+                s.fill(GREEN)
+                screen.blit(s, (rect_left, rect_top))
 
     # Draw info text
     info_text = [
@@ -689,14 +1100,17 @@ while running:
         " [Right Click] Move Here (Precise)",
         " [Z] Attack/Follow Unit (Touch)",
         " [TAB] Switch Algorithm",
-    " [D] Toggle Debug",
+        " [V] Toggle Debug",
+        " [F3] Toggle Obstacle Mode",
         " [WASD] Camera",
         "",
         f"Camera: ({camera_x}, {camera_y})",
         f"Circles: {len(circles)}",
+        f"Obstacles: {len(obstacles)}",
         f"Selected: {len(selected_circles)}",
         f"Algorithm: {avoidance_manager.get_algorithm().get_name() if avoidance_manager.get_algorithm() else 'None'}",
         f"Debug: {avoidance_config.DEBUG_ENABLED}",
+        f"Obstacle Mode: {'ON' if obstacle_placement_mode else 'OFF'}",
     ]
     
     y_offset = 10

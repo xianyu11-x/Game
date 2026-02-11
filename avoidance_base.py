@@ -9,6 +9,13 @@ class AvoidanceBase:
     def __init__(self):
         self.name = "Base Avoidance"
         self.description = "Base avoidance algorithm"
+        self.obstacles = []  # Rectangular obstacles: [{"cx","cy","w","h","angle"}]
+    
+    def set_obstacles(self, obstacles):
+        """Set rectangular obstacles for avoidance consideration.
+        Each obstacle: {"cx": x, "cy": y, "w": width, "h": height, "angle": degrees}
+        """
+        self.obstacles = obstacles
     
     def calculate_avoidance(self, circle, target_x, target_y, all_circles, delta_time):
         """

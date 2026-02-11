@@ -47,6 +47,11 @@ class PredictiveScanAvoidance(AvoidanceBase):
 
         minkowski_circles = self._get_minkowski_circles(circle, neighbors, prediction_time)
         blocked_intervals = self._get_blocked_intervals(circle, neighbors, speed, prediction_time)
+        # Merge Minkowski-based blocked intervals from rectangular obstacles
+        obstacle_blocked = self._get_obstacle_blocked_intervals(
+            circle, detection_radius, speed, prediction_time)
+        if obstacle_blocked:
+            blocked_intervals = self._merge_intervals(blocked_intervals + obstacle_blocked)
         allowed_intervals = self._get_allowed_intervals(blocked_intervals)
 
         if avoidance_config.DEBUG_ENABLED:
@@ -114,8 +119,12 @@ class PredictiveScanAvoidance(AvoidanceBase):
     def _get_neighbors_in_radius(self, circle, all_circles, radius):
         neighbors = []
         radius_sq = radius * radius
+        target_ref = circle.get("target_ref")
         for other in all_circles:
             if other is circle:
+                continue
+            # 排除Z键标记的目标单位，避免把目标当作障碍物
+            if target_ref is not None and other is target_ref:
                 continue
             dx = other["x"] - circle["x"]
             dy = other["y"] - circle["y"]
@@ -337,6 +346,197 @@ class PredictiveScanAvoidance(AvoidanceBase):
         circle["reverse_cooldown"] = cooldown
         circle["reverse_extreme_count"] = extreme_count
 
+
+    @staticmethod
+    def _clip_segment_to_circle(x1, y1, x2, y2, cx, cy, r):
+        """Return the portion of segment (x1,y1)→(x2,y2) inside circle (cx,cy,r).
+        
+        Returns (px1, py1, px2, py2) or None if no overlap.
+        """
+        dx, dy = x2 - x1, y2 - y1
+        fx, fy = x1 - cx, y1 - cy
+        a = dx * dx + dy * dy
+        if a < 1e-12:
+            if fx * fx + fy * fy <= r * r:
+                return (x1, y1, x2, y2)
+            return None
+        b = 2.0 * (fx * dx + fy * dy)
+        c = fx * fx + fy * fy - r * r
+        disc = b * b - 4.0 * a * c
+        if disc < 0:
+            return None
+        sd = math.sqrt(disc)
+        t1 = (-b - sd) / (2.0 * a)
+        t2 = (-b + sd) / (2.0 * a)
+        t_lo = max(0.0, t1)
+        t_hi = min(1.0, t2)
+        if t_lo > t_hi + 1e-9:
+            return None
+        return (x1 + t_lo * dx, y1 + t_lo * dy,
+                x1 + t_hi * dx, y1 + t_hi * dy)
+
+    def _get_obstacle_blocked_intervals(self, circle, detection_radius,
+                                        self_speed, prediction_time):
+        """Compute blocked angle intervals from rectangular obstacles.
+        
+        Decomposes each obstacle's Minkowski sum (rounded rectangle) into
+        4 straight edge segments + 4 corner circles.
+        
+        Edge segments: clipped to detection circle, angles to clipped endpoints.
+        Corner circles: same time-parametric intersection logic as circle-circle
+                        detection (_get_blocked_intervals), ensuring consistent
+                        behaviour and natural detection-radius clipping.
+        """
+        if not self.obstacles:
+            return []
+        
+        blocked = []
+        ax, ay = circle["x"], circle["y"]
+        expand = circle["radius"] + self.config["collision_padding"]
+        det_r = detection_radius
+        
+        for obs in self.obstacles:
+            hw, hh = obs["w"] / 2.0, obs["h"] / 2.0
+            
+            # Transform agent into obstacle local space
+            neg_rad = math.radians(-obs["angle"])
+            cos_n = math.cos(neg_rad)
+            sin_n = math.sin(neg_rad)
+            ddx = ax - obs["cx"]
+            ddy = ay - obs["cy"]
+            lx = ddx * cos_n - ddy * sin_n
+            ly = ddx * sin_n + ddy * cos_n
+            
+            # Inside rounded rectangle check
+            inside = False
+            if abs(lx) <= hw and abs(ly) <= hh + expand:
+                inside = True
+            elif abs(lx) <= hw + expand and abs(ly) <= hh:
+                inside = True
+            else:
+                cdx = abs(lx) - hw
+                cdy = abs(ly) - hh
+                if cdx > 0 and cdy > 0 and cdx * cdx + cdy * cdy <= expand * expand:
+                    inside = True
+            
+            if inside:
+                # Block towards-obstacle half, allow escape outward
+                esc = math.degrees(math.atan2(ddy, ddx))
+                esc = ((esc + 180.0) % 360.0) - 180.0
+                bs = ((esc + 90.0 + 180.0) % 360.0) - 180.0
+                be = ((esc - 90.0 + 180.0) % 360.0) - 180.0
+                if bs <= be:
+                    blocked.append((bs, be))
+                else:
+                    blocked.append((bs, 180.0))
+                    blocked.append((-180.0, be))
+                continue
+            
+            # Quick cull: closest point on original rect surface
+            cp_x = max(-hw, min(hw, lx))
+            cp_y = max(-hh, min(hh, ly))
+            if math.hypot(lx - cp_x, ly - cp_y) > det_r + expand:
+                continue
+            
+            # World-space transform
+            obs_rad = math.radians(obs["angle"])
+            cos_o = math.cos(obs_rad)
+            sin_o = math.sin(obs_rad)
+            
+            def tw(plx, ply):
+                return (obs["cx"] + plx * cos_o - ply * sin_o,
+                        obs["cy"] + plx * sin_o + ply * cos_o)
+            
+            e = expand
+            angles = []
+            
+            # --- 4 edge segments, clipped to detection circle ---
+            segs = [
+                ((-hw, -hh - e), ( hw, -hh - e)),   # bottom
+                (( hw + e, -hh), ( hw + e,  hh)),    # right
+                (( hw,  hh + e), (-hw,  hh + e)),    # top
+                ((-hw - e,  hh), (-hw - e, -hh)),    # left
+            ]
+            for (sl1, sl2) in segs:
+                w1 = tw(*sl1)
+                w2 = tw(*sl2)
+                clipped = self._clip_segment_to_circle(
+                    w1[0], w1[1], w2[0], w2[1], ax, ay, det_r)
+                if clipped is None:
+                    continue
+                a1 = math.degrees(math.atan2(clipped[1] - ay, clipped[0] - ax))
+                a2 = math.degrees(math.atan2(clipped[3] - ay, clipped[2] - ax))
+                angles.append(((a1 + 180.0) % 360.0) - 180.0)
+                angles.append(((a2 + 180.0) % 360.0) - 180.0)
+            
+            # --- 4 corner circles (static obstacle: no time sampling needed) ---
+            # Corner circle: static, center at rect corner, radius = expand.
+            # Since the obstacle doesn't move, the relative position is constant
+            # across all prediction times. We only need to compute once using
+            # self_distance = self_speed * prediction_time (maximum reach).
+            corners = [(hw, hh), (-hw, hh), (-hw, -hh), (hw, -hh)]
+            self_distance = self_speed * prediction_time
+            for clx, cly in corners:
+                wc = tw(clx, cly)
+                p0x = wc[0] - ax
+                p0y = wc[1] - ay
+                base_dist = math.hypot(p0x, p0y)
+                
+                if base_dist <= 1e-6:
+                    return [(-180.0, 180.0)]
+                if base_dist <= e:
+                    return [(-180.0, 180.0)]
+                if base_dist - e > det_r:
+                    continue  # corner circle fully outside detection
+                
+                if self_distance <= 1e-6:
+                    continue
+                # Static obstacle: distance is constant = base_dist
+                if base_dist > self_distance + e:
+                    continue
+                if base_dist < abs(self_distance - e):
+                    if e >= self_distance + base_dist:
+                        return [(-180.0, 180.0)]
+                    continue
+                
+                cos_half = (base_dist * base_dist + self_distance * self_distance - e * e) / (2.0 * base_dist * self_distance)
+                cos_half = max(-1.0, min(1.0, cos_half))
+                half_angle = math.degrees(math.acos(cos_half))
+                
+                center_angle = normalize_angle(math.degrees(math.atan2(p0y, p0x)))
+                start = normalize_angle(center_angle - half_angle)
+                end = normalize_angle(center_angle + half_angle)
+                
+                if start <= end:
+                    blocked.append((start, end))
+                else:
+                    blocked.append((start, 180.0))
+                    blocked.append((-180.0, end))
+            
+            # Edge segment angles → largest-gap → blocked interval
+            if len(angles) >= 2:
+                angles.sort()
+                n = len(angles)
+                max_gap = -1.0
+                max_gap_idx = 0
+                for i in range(n):
+                    if i < n - 1:
+                        gap = angles[i + 1] - angles[i]
+                    else:
+                        gap = (angles[0] + 360.0) - angles[n - 1]
+                    if gap > max_gap:
+                        max_gap = gap
+                        max_gap_idx = i
+                
+                b_start = angles[(max_gap_idx + 1) % n]
+                b_end = angles[max_gap_idx]
+                if b_start <= b_end:
+                    blocked.append((b_start, b_end))
+                else:
+                    blocked.append((b_start, 180.0))
+                    blocked.append((-180.0, b_end))
+        
+        return self._merge_intervals(blocked) if blocked else []
 
     def _apply_fallback(self, circle, target_angle, delta_time):
         fallback = self.config["fallback_method"]
