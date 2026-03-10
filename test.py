@@ -9,8 +9,8 @@ from avoidance_manager import AvoidanceManager
 pygame.init()
 
 # Window setup
-WINDOW_WIDTH = 1200
-WINDOW_HEIGHT = 800
+WINDOW_WIDTH = 1680
+WINDOW_HEIGHT = 1120
 screen = pygame.display.set_mode((WINDOW_WIDTH, WINDOW_HEIGHT))
 pygame.display.set_caption("2D Game - WASD Camera Movement")
 
@@ -22,6 +22,19 @@ BLUE = (100, 149, 237)
 GREEN = (0, 255, 0)
 YELLOW = (255, 255, 0)
 
+# Group colors (Ctrl+1~9)
+GROUP_COLORS = {
+    1: (220, 60, 60),     # 红
+    2: (60, 100, 220),    # 蓝
+    3: (60, 200, 60),     # 绿
+    4: (220, 200, 40),    # 黄
+    5: (200, 60, 200),    # 紫
+    6: (40, 200, 200),    # 青
+    7: (240, 140, 40),    # 橙
+    8: (140, 60, 220),    # 靛
+    9: (100, 180, 100),   # 暗绿
+}
+
 # Camera settings
 camera_x = 0
 camera_y = 0
@@ -32,6 +45,7 @@ circles = []  # Each element: {"x": x, "y": y, "label": label, "target_x": None,
 circle_counter = 0
 selected_circles = []  # Changed to list
 global_target = None   # (x, y)
+global_target_ref = None  # Reference to the target circle for continuous following
 is_dragging = False
 drag_start_pos = (0, 0)
 obstacles = []  # Each: {"cx": cx, "cy": cy, "w": w, "h": h, "angle": 0}
@@ -123,10 +137,147 @@ def get_closest_reachable_target(
 
     return target_x, target_y
 
+AUTO_TARGET_SCAN_INTERVAL = 1.0  # 索敌扫描间隔（秒）
+
+def update_auto_targeting(all_circles, delta_time):
+    """Auto-targeting system: grouped units detect and chase enemies from other groups.
+    
+    Rules:
+    - Only units with group > 0 participate
+    - A unit scans for enemies (units from different groups, also group > 0) within detection_range
+    - Picks the nearest enemy as target
+    - Re-evaluates targets every AUTO_TARGET_SCAN_INTERVAL seconds
+    - When target is within attack_range, stop movement (don't re-evaluate)
+    - Manual targets (auto_target=False) are not overridden by auto-targeting
+    """
+    for circle in all_circles:
+        my_group = circle.get("group", 0)
+        if my_group == 0:
+            continue  # No group, skip auto-targeting
+
+        detection_range = circle.get("detection_range", 200)
+        attack_range = circle.get("attack_range", 80)
+
+        # If this unit has a manual target (Z-key or right-click), skip auto-targeting
+        if circle.get("target_ref") is not None and not circle.get("auto_target", False):
+            continue
+        if circle.get("target_x") is not None and not circle.get("auto_target", False):
+            continue
+
+        # Check if current auto-target is within attack range → stop, don't re-evaluate
+        current_ref = circle.get("target_ref")
+        if current_ref is not None and circle.get("auto_target", False):
+            if current_ref in all_circles:
+                dist_to_target = math.hypot(current_ref["x"] - circle["x"],
+                                            current_ref["y"] - circle["y"])
+                if dist_to_target <= attack_range:
+                    # Target in attack range → mark as in-range, stop movement
+                    circle["in_attack_range"] = True
+                    circle["target_x"] = None
+                    circle["target_y"] = None
+                    # Keep target_ref so we can track if it leaves attack range
+                    continue
+                else:
+                    circle["in_attack_range"] = False
+            else:
+                # Target no longer exists, clear and force immediate rescan
+                circle["target_ref"] = None
+                circle["target_x"] = None
+                circle["target_y"] = None
+                circle["auto_target"] = False
+                circle["in_attack_range"] = False
+                circle["auto_scan_timer"] = 0.0
+
+        # If we have an auto-target that's still in attack range (stopped), check if it left
+        if circle.get("in_attack_range", False) and current_ref is not None:
+            if current_ref in all_circles:
+                dist_to_target = math.hypot(current_ref["x"] - circle["x"],
+                                            current_ref["y"] - circle["y"])
+                if dist_to_target <= attack_range:
+                    continue  # Still in range, stay stopped
+                else:
+                    circle["in_attack_range"] = False
+                    circle["auto_scan_timer"] = 0.0  # Force immediate rescan
+                    # Fall through to re-evaluate
+            else:
+                circle["target_ref"] = None
+                circle["auto_target"] = False
+                circle["in_attack_range"] = False
+                circle["auto_scan_timer"] = 0.0
+
+        # Throttle re-scan: only scan every AUTO_TARGET_SCAN_INTERVAL seconds
+        scan_timer = circle.get("auto_scan_timer", 0.0)
+        scan_timer -= delta_time
+        if scan_timer > 0.0:
+            circle["auto_scan_timer"] = scan_timer
+            continue  # Not time to re-scan yet
+        circle["auto_scan_timer"] = AUTO_TARGET_SCAN_INTERVAL
+
+        # Scan for nearest enemy within detection range
+        nearest_enemy = None
+        nearest_dist = float('inf')
+
+        for other in all_circles:
+            if other is circle:
+                continue
+            other_group = other.get("group", 0)
+            if other_group == 0 or other_group == my_group:
+                continue  # Same group or no group → not an enemy
+
+            dist = math.hypot(other["x"] - circle["x"], other["y"] - circle["y"])
+            if dist <= detection_range and dist < nearest_dist:
+                nearest_dist = dist
+                nearest_enemy = other
+
+        if nearest_enemy is not None:
+            # Set or update auto-target
+            circle["target_x"] = nearest_enemy["x"]
+            circle["target_y"] = nearest_enemy["y"]
+            circle["target_radius"] = nearest_enemy["radius"]
+            circle["target_ref"] = nearest_enemy
+            circle["auto_target"] = True
+            circle["in_attack_range"] = False
+            circle["arrival_threshold"] = circle["radius"] + nearest_enemy["radius"] + 5
+        else:
+            # No enemy in range, clear auto-target if we had one
+            if circle.get("auto_target", False):
+                circle["target_ref"] = None
+                circle["in_attack_range"] = False
+                wp_x = circle.get("waypoint_x")
+                wp_y = circle.get("waypoint_y")
+                if wp_x is not None and wp_y is not None:
+                    circle["target_x"] = wp_x
+                    circle["target_y"] = wp_y
+                    circle["target_radius"] = 0.0
+                    circle["arrival_threshold"] = 5
+                else:
+                    circle["target_x"] = None
+                    circle["target_y"] = None
+                    circle["target_radius"] = None
+                    circle["auto_target"] = False
+
+
 def move_circle_towards_target(circle, delta_time, all_circles, avoidance_algorithm):
     """Move circle towards its target position with speed and rotation, using avoidance plugin"""
     if circle["target_x"] is None or circle["target_y"] is None:
         return
+
+    # Continuously follow target_ref if it exists (e.g. Z-key follow)
+    target_ref = circle.get("target_ref")
+    if target_ref is not None:
+        # Check if target_ref is still valid (still in the circles list)
+        if target_ref in all_circles:
+            circle["target_x"] = target_ref["x"]
+            circle["target_y"] = target_ref["y"]
+            circle["target_radius"] = target_ref["radius"]
+        else:
+            # Target no longer exists, stop following
+            circle["target_x"] = None
+            circle["target_y"] = None
+            circle["target_radius"] = None
+            circle["target_ref"] = None
+            circle["debug_reachable_target"] = None
+            return
 
     extra_margin = 5.0
     target_radius = circle.get("target_radius", 0.0) or 0.0
@@ -147,6 +298,9 @@ def move_circle_towards_target(circle, delta_time, all_circles, avoidance_algori
     distance_to_target = math.hypot(circle["target_x"] - circle["x"], circle["target_y"] - circle["y"])
     arrival_threshold = circle.get("arrival_threshold", 5)
     if distance_to_target < arrival_threshold:
+        if circle.get("waypoint_x") is not None and circle.get("target_ref") is None:
+            circle["waypoint_x"] = None
+            circle["waypoint_y"] = None
         circle["target_x"] = None
         circle["target_y"] = None
         circle["target_radius"] = None
@@ -202,7 +356,6 @@ def move_circle_towards_target(circle, delta_time, all_circles, avoidance_algori
         circle["y"] += move_distance * math.sin(math.radians(circle["angle"]))
     
     # Apply collision response to separate overlapping circles
-    # 只对有目标的圆形应用碰撞响应，避免目标点被推动
     if circle["target_x"] is not None and circle["target_y"] is not None:
         push_x, push_y = get_collision_response(circle, all_circles)
         circle["x"] += push_x
@@ -210,6 +363,9 @@ def move_circle_towards_target(circle, delta_time, all_circles, avoidance_algori
 
         distance_to_target = math.hypot(circle["target_x"] - circle["x"], circle["target_y"] - circle["y"])
         if distance_to_target < arrival_threshold:
+            if circle.get("waypoint_x") is not None and circle.get("target_ref") is None:
+                circle["waypoint_x"] = None
+                circle["waypoint_y"] = None
             circle["target_x"] = None
             circle["target_y"] = None
             circle["target_radius"] = None
@@ -295,6 +451,25 @@ def draw_minkowski_circles(surface, circle, camera_x, camera_y, color=(255, 0, 0
         screen_x, screen_y = world_to_screen(center_x, center_y, camera_x, camera_y)
         pygame.draw.circle(surface, color, (int(screen_x), int(screen_y)), int(radius), 1)
 
+GROUP_DRAW_COLORS = [
+    (220, 80, 80), (80, 140, 220), (80, 200, 80), (220, 180, 40),
+    (180, 80, 220), (40, 200, 200), (240, 140, 40), (140, 80, 200),
+]
+
+def draw_mink_groups(surface, circle, camera_x, camera_y):
+    """Draw Minkowski-sum groups with per-group colours (blocking groups use thicker lines)."""
+    groups = circle.get("debug_mink_groups")
+    if not groups:
+        return
+    for idx, g in enumerate(groups):
+        color = GROUP_DRAW_COLORS[idx % len(GROUP_DRAW_COLORS)]
+        width = 2 if g.get("blocking") else 1
+        for entry in g.get("circles", []):
+            cx, cy = entry["center"]
+            r = entry["radius"]
+            sx, sy = world_to_screen(cx, cy, camera_x, camera_y)
+            pygame.draw.circle(surface, color, (int(sx), int(sy)), int(r), width)
+
 def draw_reverse_cooldown(surface, circle, camera_x, camera_y, font, color=(160, 0, 160)):
     """Draw reverse cooldown timer for a circle if active."""
     cooldown = circle.get("reverse_cooldown", 0.0)
@@ -344,49 +519,67 @@ def draw_orca_debug(surface, circle, camera_x, camera_y, font,
         surface.blit(label_surface, label_rect)
 
 def draw_orca_constraints(surface, circle, camera_x, camera_y,
-                          line_color=(60, 60, 60), normal_color=(120, 0, 200, 160)):
-    """Draw ORCA constraint lines and approximate half-planes in velocity space."""
+                          agent_line_color=(60, 60, 60),
+                          agent_fill_color=(120, 0, 200, 100),
+                          obst_line_color=(200, 60, 20),
+                          obst_fill_color=(200, 60, 20, 80)):
+    """Draw RVO2 ORCA constraint half-planes in velocity space.
+    
+    In RVO2, each ORCA line has:
+      - point: a point on the constraint boundary (velocity space)
+      - direction: tangent vector along the boundary
+      - allowed region: LEFT side of the direction vector
+    Obstacle constraints are drawn in red/orange, agent constraints in purple.
+    """
     orca_lines = circle.get("debug_orca_lines")
     if not orca_lines:
         return
 
-    scale = circle.get("debug_orca_velocity_scale", 0.5)
+    num_obst = circle.get("debug_orca_num_obst_lines", 0)
+    vel_scale = circle.get("debug_orca_velocity_scale", 0.5)
     screen_x, screen_y = world_to_screen(circle["x"], circle["y"], camera_x, camera_y)
 
     overlay = pygame.Surface((WINDOW_WIDTH, WINDOW_HEIGHT), pygame.SRCALPHA)
 
-    for line in orca_lines:
+    for idx, line in enumerate(orca_lines):
         point = line.get("point")
         direction = line.get("direction")
         if not point or not direction:
             continue
 
-        normal_x, normal_y = direction
-        normal_len = math.hypot(normal_x, normal_y)
-        if normal_len < 1e-6:
+        is_obst = idx < num_obst
+        lc = obst_line_color if is_obst else agent_line_color
+        fc = obst_fill_color if is_obst else agent_fill_color
+        arrow_c = (200, 60, 20) if is_obst else (120, 0, 200)
+
+        tangent_x, tangent_y = direction
+        tangent_len = math.hypot(tangent_x, tangent_y)
+        if tangent_len < 1e-6:
             continue
+        tangent_x /= tangent_len
+        tangent_y /= tangent_len
 
-        normal_x /= normal_len
-        normal_y /= normal_len
-        tangent_x = -normal_y
-        tangent_y = normal_x
+        normal_x = -tangent_y
+        normal_y = tangent_x
 
-        anchor_x = screen_x + point[0] * scale
-        anchor_y = screen_y + point[1] * scale
+        anchor_x = screen_x + point[0] * vel_scale
+        anchor_y = screen_y + point[1] * vel_scale
 
         line_half_len = 120
-        half_plane_len = 140
+        half_plane_depth = 100
 
         p1 = (anchor_x + tangent_x * line_half_len, anchor_y + tangent_y * line_half_len)
         p2 = (anchor_x - tangent_x * line_half_len, anchor_y - tangent_y * line_half_len)
-        p3 = (p2[0] + normal_x * half_plane_len, p2[1] + normal_y * half_plane_len)
-        p4 = (p1[0] + normal_x * half_plane_len, p1[1] + normal_y * half_plane_len)
+        p3 = (p2[0] + normal_x * half_plane_depth, p2[1] + normal_y * half_plane_depth)
+        p4 = (p1[0] + normal_x * half_plane_depth, p1[1] + normal_y * half_plane_depth)
 
-        pygame.draw.polygon(overlay, normal_color, [p1, p2, p3, p4])
-        pygame.draw.line(surface, line_color, (int(p1[0]), int(p1[1])), (int(p2[0]), int(p2[1])), 2)
+        pygame.draw.polygon(overlay, fc, [p1, p2, p3, p4])
+        pygame.draw.line(surface, lc, (int(p1[0]), int(p1[1])), (int(p2[0]), int(p2[1])), 2)
 
-        arrow_end = (anchor_x + normal_x * 20, anchor_y + normal_y * 20)
-        pygame.draw.line(surface, (120, 0, 200), (int(anchor_x), int(anchor_y)), (int(arrow_end[0]), int(arrow_end[1])), 2)
+        arrow_end = (anchor_x + normal_x * 18, anchor_y + normal_y * 18)
+        pygame.draw.line(surface, arrow_c, (int(anchor_x), int(anchor_y)),
+                         (int(arrow_end[0]), int(arrow_end[1])), 2)
+        pygame.draw.circle(surface, arrow_c, (int(arrow_end[0]), int(arrow_end[1])), 3, 0)
 
     surface.blit(overlay, (0, 0))
 
@@ -619,25 +812,48 @@ def draw_obstacle_detection(surface, circle, camera_x, camera_y, obstacles_list)
 
 
 def draw_orca_stats(surface, circle, camera_x, camera_y, font, color=(30, 30, 30)):
-    """Draw ORCA diagnostic stats for stuck investigation."""
+    """Draw ORCA / RVO2 diagnostic stats."""
     stats = circle.get("debug_orca_stats")
     if not stats or font is None:
         return
 
     screen_x, screen_y = world_to_screen(circle["x"], circle["y"], camera_x, camera_y)
+    obst_c = stats.get('obst_constraints', 0)
+    agent_c = stats.get('constraints', 0) - obst_c
     lines = [
-        f"N {stats.get('neighbors', 0)} / C {stats.get('constraints', 0)}",
-        f"V {stats.get('new_speed', 0.0):.1f} / P {stats.get('pref_speed', 0.0):.1f}",
-        f"COL {int(stats.get('collision_pred', False))}",
-        f"Dmin {stats.get('nearest_dist', 0.0):.1f}",
-        f"Tdist {stats.get('target_dist', 0.0):.1f}",
-        f"Drop {stats.get('filtered_neighbors', 0)}",
+        f"N {stats.get('neighbors', 0)}  OC {obst_c}  AC {agent_c}",
+        f"V {stats.get('new_speed', 0.0):.1f} / Pref {stats.get('pref_speed', 0.0):.1f}",
+        f"Dmin {stats.get('nearest_dist', 0.0):.1f}  Tdist {stats.get('target_dist', 0.0):.1f}",
     ]
+    lp_ok = stats.get("lp_feasible", True)
+    if lp_ok:
+        lines.append("LP OK")
+    else:
+        lines.append(f"LP FAIL @line {stats.get('fail_line', '?')}")
+    if stats.get("stuck_retry_used", False):
+        lines.append("RETRY ON")
+    if stats.get("attack_hold", False):
+        lines.append("ATK HOLD")
 
     for i, text in enumerate(lines):
-        label_surface = font.render(text, True, color)
+        c = color if lp_ok or i < len(lines) - 1 else (220, 30, 30)
+        label_surface = font.render(text, True, c)
         label_rect = label_surface.get_rect(center=(int(screen_x), int(screen_y + 75 + i * 16)))
         surface.blit(label_surface, label_rect)
+
+def draw_rvo2_obstacle_segments(surface, circle, camera_x, camera_y,
+                                seg_color=(20, 180, 120), dot_color=(20, 180, 120)):
+    """Draw the obstacle line segments that RVO2 uses for ORCA constraints."""
+    segments = circle.get("debug_rvo2_obst_segments")
+    if not segments:
+        return
+
+    for seg_start, seg_end in segments:
+        sx1, sy1 = world_to_screen(seg_start[0], seg_start[1], camera_x, camera_y)
+        sx2, sy2 = world_to_screen(seg_end[0], seg_end[1], camera_x, camera_y)
+        pygame.draw.line(surface, seg_color, (int(sx1), int(sy1)), (int(sx2), int(sy2)), 2)
+        pygame.draw.circle(surface, dot_color, (int(sx1), int(sy1)), 3, 0)
+        pygame.draw.circle(surface, dot_color, (int(sx2), int(sy2)), 3, 0)
 
 def world_to_screen(world_x, world_y, camera_x, camera_y):
     """Convert world coordinates to screen coordinates"""
@@ -812,6 +1028,7 @@ while running:
                     
                     # Clear global target marking (cancel Z-target)
                     global_target = None
+                    global_target_ref = None
                     
                     mouse_x, mouse_y = pygame.mouse.get_pos()
                     world_x, world_y = screen_to_world(mouse_x, mouse_y, camera_x, camera_y)
@@ -822,6 +1039,10 @@ while running:
                         circle["target_radius"] = 0.0
                         circle["target_ref"] = None
                         circle["arrival_threshold"] = 5  # Precise arrival
+                        circle["auto_target"] = False    # Manual target overrides auto
+                        circle["in_attack_range"] = False
+                        circle["waypoint_x"] = None
+                        circle["waypoint_y"] = None
                         
         elif event.type == pygame.MOUSEBUTTONUP:
             if event.button == 1:  # Left click release
@@ -894,7 +1115,14 @@ while running:
                     "speed": 100,
                     "turn_speed": 180,
                     "radius": 25,
-                    "arrival_threshold": 5
+                    "arrival_threshold": 5,
+                    "group": 0,              # 0 = 无分组
+                    "unit_type": "melee",    # "melee" 近战 / "ranged" 远程
+                    "detection_range": 400,  # 索敌范围
+                    "attack_range": 25 * 2,  # 攻击范围：近战=2倍半径
+                    "auto_target": False,    # 当前目标是否为自动索敌获取
+                    "waypoint_x": None,     # X键低优先级移动目标
+                    "waypoint_y": None,
                 }
                 
                 can_place = True
@@ -921,6 +1149,7 @@ while running:
                 
                 if target_unit:
                     global_target = (target_unit["x"], target_unit["y"])
+                    global_target_ref = target_unit  # Store reference for continuous following
                     print(f"Target set to {target_unit['label']}")
                     
                     if selected_circles:
@@ -931,8 +1160,10 @@ while running:
                             circle["target_y"] = target_unit["y"]
                             circle["target_radius"] = target_unit["radius"]
                             circle["target_ref"] = target_unit
-                            # Arrive when touching (Radius + Radius + Margin)
-                            # 这样可以实现多个单位围住一个目标
+                            circle["auto_target"] = False  # Manual target overrides auto
+                            circle["in_attack_range"] = False
+                            circle["waypoint_x"] = None
+                            circle["waypoint_y"] = None
                             circle["arrival_threshold"] = circle["radius"] + target_unit["radius"] + 5
                 
             if event.key == pygame.K_TAB:
@@ -944,10 +1175,79 @@ while running:
                 # Toggle debug visuals
                 avoidance_config.DEBUG_ENABLED = not avoidance_config.DEBUG_ENABLED
                 print(f"Debug enabled: {avoidance_config.DEBUG_ENABLED}")
+            if event.key == pygame.K_n:
+                # Toggle unit type for selected circles: melee ↔ ranged
+                if selected_circles:
+                    for circle in selected_circles:
+                        if circle.get("unit_type", "melee") == "melee":
+                            circle["unit_type"] = "ranged"
+                            circle["attack_range"] = circle["radius"] * 6
+                        else:
+                            circle["unit_type"] = "melee"
+                            circle["attack_range"] = circle["radius"] * 2
+                    types = set(c.get("unit_type", "melee") for c in selected_circles)
+                    type_str = "近战(Melee)" if "melee" in types and len(types) == 1 else \
+                               "远程(Ranged)" if "ranged" in types and len(types) == 1 else "混合"
+                    print(f"Switched {len(selected_circles)} unit(s) to {type_str}")
+
+            if event.key == pygame.K_c:
+                # Cancel all manual targets for selected circles, let auto-targeting take over
+                if selected_circles:
+                    for circle in selected_circles:
+                        circle["target_x"] = None
+                        circle["target_y"] = None
+                        circle["target_radius"] = None
+                        circle["target_ref"] = None
+                        circle["auto_target"] = False
+                        circle["in_attack_range"] = False
+                        circle["debug_reachable_target"] = None
+                        circle["waypoint_x"] = None
+                        circle["waypoint_y"] = None
+                    # Also clear global target if it was set
+                    global_target = None
+                    global_target_ref = None
+                    print(f"Cleared targets for {len(selected_circles)} unit(s) → auto-targeting")
+
+            if event.key == pygame.K_x:
+                if selected_circles:
+                    mouse_x, mouse_y = pygame.mouse.get_pos()
+                    world_x, world_y = screen_to_world(mouse_x, mouse_y, camera_x, camera_y)
+
+                    for circle in selected_circles:
+                        circle["waypoint_x"] = world_x
+                        circle["waypoint_y"] = world_y
+                        if circle.get("target_ref") is not None and circle.get("auto_target", False):
+                            pass
+                        else:
+                            circle["target_x"] = world_x
+                            circle["target_y"] = world_y
+                            circle["target_radius"] = 0.0
+                            circle["target_ref"] = None
+                            circle["auto_target"] = True
+                            circle["in_attack_range"] = False
+                            circle["arrival_threshold"] = 5
+                    print(f"Waypoint set for {len(selected_circles)} unit(s) (low priority)")
+
             if event.key == pygame.K_F3:
                 # Toggle obstacle placement mode
                 obstacle_placement_mode = not obstacle_placement_mode
                 print(f"Obstacle placement: {'ON' if obstacle_placement_mode else 'OFF'}")
+
+            # Ctrl+1~9: Assign selected circles to a group
+            number_keys = {
+                pygame.K_1: 1, pygame.K_2: 2, pygame.K_3: 3,
+                pygame.K_4: 4, pygame.K_5: 5, pygame.K_6: 6,
+                pygame.K_7: 7, pygame.K_8: 8, pygame.K_9: 9,
+            }
+            mods = pygame.key.get_mods()
+            if event.key in number_keys and (mods & pygame.KMOD_CTRL):
+                group_id = number_keys[event.key]
+                if selected_circles:
+                    for circle in selected_circles:
+                        circle["group"] = group_id
+                    print(f"Assigned {len(selected_circles)} unit(s) to Group {group_id}")
+                else:
+                    print(f"No units selected for Group {group_id}")
     
     # Keyboard input - WASD camera movement
     keys = pygame.key.get_pressed()
@@ -960,15 +1260,27 @@ while running:
     if keys[pygame.K_d]:
         camera_x += camera_speed
     
+    # Update global_target position from reference (continuous following)
+    if global_target_ref is not None:
+        if global_target_ref in circles:
+            global_target = (global_target_ref["x"], global_target_ref["y"])
+        else:
+            # Target circle was removed
+            global_target = None
+            global_target_ref = None
+
     # Update circle movements
     delta_time = clock.get_time() / 1000.0  # Convert to seconds
+
+    # Auto-targeting: grouped units detect and chase enemies (scans every 1s)
+    update_auto_targeting(circles, delta_time)
     current_algorithm = avoidance_manager.get_algorithm()
     # Pass obstacle data to avoidance algorithm (Minkowski blocking, no virtual circles)
     if current_algorithm:
         current_algorithm.set_obstacles(obstacles)
     for circle in circles:
         move_circle_towards_target(circle, delta_time, circles, current_algorithm)
-    # Apply obstacle hard collision for ALL circles (even stationary ones)
+    # Apply obstacle hard collision for ALL circles (prevents overlap with obstacles)
     if obstacles:
         for circle in circles:
             obs_px, obs_py = get_obstacle_push(circle, obstacles)
@@ -997,12 +1309,34 @@ while running:
         
         # Only draw circles within screen bounds (optimization)
         if -50 < screen_x < WINDOW_WIDTH + 50 and -50 < screen_y < WINDOW_HEIGHT + 50:
-            # Determine color based on selection
-            circle_color = GREEN if circle in selected_circles else BLUE
+            # Determine color based on group and selection
+            group_id = circle.get("group", 0)
+            if circle in selected_circles:
+                circle_color = GREEN
+            elif group_id > 0 and group_id in GROUP_COLORS:
+                circle_color = GROUP_COLORS[group_id]
+            else:
+                circle_color = BLUE
             
-            # Draw circle
+            # Draw detection range and attack range circles (for grouped units)
+            if group_id > 0:
+                detection_range = circle.get("detection_range", 200)
+                attack_range = circle.get("attack_range", 80)
+                # Detection range (dashed-style, semi-transparent)
+                det_color = (*GROUP_COLORS.get(group_id, (100, 100, 100)), 40)
+                atk_color = (*GROUP_COLORS.get(group_id, (100, 100, 100)), 70)
+                range_overlay = pygame.Surface((WINDOW_WIDTH, WINDOW_HEIGHT), pygame.SRCALPHA)
+                pygame.draw.circle(range_overlay, det_color, (int(screen_x), int(screen_y)), int(detection_range), 1)
+                pygame.draw.circle(range_overlay, atk_color, (int(screen_x), int(screen_y)), int(attack_range), 1)
+                screen.blit(range_overlay, (0, 0))
+
+            # Draw circle body
             pygame.draw.circle(screen, circle_color, (int(screen_x), int(screen_y)), circle["radius"])
             pygame.draw.circle(screen, BLACK, (int(screen_x), int(screen_y)), circle["radius"], 2)
+            
+            # Draw "in attack range" indicator (pulsing ring)
+            if circle.get("in_attack_range", False):
+                pygame.draw.circle(screen, (255, 50, 50), (int(screen_x), int(screen_y)), circle["radius"] + 4, 2)
             
             # Draw direction indicator (arrow)
             import math
@@ -1012,10 +1346,31 @@ while running:
             pygame.draw.line(screen, RED, (int(screen_x), int(screen_y)), 
                            (int(arrow_x), int(arrow_y)), 3)
             
-            # Draw label
-            label_surface = font.render(circle["label"], True, BLACK)
+            # Draw label + group number
+            unit_type = circle.get("unit_type", "melee")
+            type_icon = "⚔" if unit_type == "melee" else "🏹"
+            label_text = circle["label"]
+            if group_id > 0:
+                label_text = f"[G{group_id}] {label_text}"
+            label_surface = font.render(label_text, True, BLACK)
             label_rect = label_surface.get_rect(center=(int(screen_x), int(screen_y - 35)))
             screen.blit(label_surface, label_rect)
+            # Draw unit type indicator below circle
+            type_label = "M" if unit_type == "melee" else "R"
+            type_color = (180, 100, 40) if unit_type == "melee" else (40, 100, 180)
+            type_surface = small_font.render(type_label, True, type_color)
+            type_rect = type_surface.get_rect(center=(int(screen_x), int(screen_y + circle["radius"] + 10)))
+            screen.blit(type_surface, type_rect)
+
+            # Draw auto-target line (orange dashed-style) for auto-targeting units
+            if circle.get("auto_target", False) and circle.get("target_ref") is not None:
+                target_ref = circle["target_ref"]
+                if target_ref in circles:
+                    tr_sx, tr_sy = world_to_screen(target_ref["x"], target_ref["y"], camera_x, camera_y)
+                    line_color = (255, 80, 0) if not circle.get("in_attack_range", False) else (255, 50, 50)
+                    pygame.draw.line(screen, line_color,
+                                     (int(screen_x), int(screen_y)),
+                                     (int(tr_sx), int(tr_sy)), 1)
             
             # Draw target position if exists (individual target)
             if circle["target_x"] is not None and circle["target_y"] is not None:
@@ -1048,11 +1403,35 @@ while running:
                 draw_allowed_angles(screen, circle, camera_x, camera_y)
                 draw_velocity_direction(screen, circle, camera_x, camera_y)
                 draw_minkowski_circles(screen, circle, camera_x, camera_y)
+                draw_mink_groups(screen, circle, camera_x, camera_y)
                 draw_reverse_cooldown(screen, circle, camera_x, camera_y, small_font)
                 draw_orca_debug(screen, circle, camera_x, camera_y, small_font)
                 draw_orca_constraints(screen, circle, camera_x, camera_y)
                 draw_orca_stats(screen, circle, camera_x, camera_y, small_font)
                 draw_obstacle_detection(screen, circle, camera_x, camera_y, obstacles)
+                draw_rvo2_obstacle_segments(screen, circle, camera_x, camera_y)
+
+    # Draw waypoint markers (X key)
+    CYAN = (0, 200, 200)
+    for circle in circles:
+        wp_x = circle.get("waypoint_x")
+        wp_y = circle.get("waypoint_y")
+        if wp_x is not None and wp_y is not None:
+            wp_sx, wp_sy = world_to_screen(wp_x, wp_y, camera_x, camera_y)
+            if -50 < wp_sx < WINDOW_WIDTH + 50 and -50 < wp_sy < WINDOW_HEIGHT + 50:
+                sz = 8
+                diamond = [
+                    (int(wp_sx), int(wp_sy - sz)),
+                    (int(wp_sx + sz), int(wp_sy)),
+                    (int(wp_sx), int(wp_sy + sz)),
+                    (int(wp_sx - sz), int(wp_sy)),
+                ]
+                pygame.draw.polygon(screen, CYAN, diamond, 2)
+                if circle in selected_circles:
+                    cx_s, cy_s = world_to_screen(circle["x"], circle["y"], camera_x, camera_y)
+                    pygame.draw.line(screen, (*CYAN, 120),
+                                     (int(cx_s), int(cy_s)),
+                                     (int(wp_sx), int(wp_sy)), 1)
 
     # Draw global target (Z key)
     if global_target:
@@ -1092,6 +1471,13 @@ while running:
                 s.fill(GREEN)
                 screen.blit(s, (rect_left, rect_top))
 
+    # Count groups
+    group_counts = {}
+    for c in circles:
+        g = c.get("group", 0)
+        if g > 0:
+            group_counts[g] = group_counts.get(g, 0) + 1
+
     # Draw info text
     info_text = [
         "Controls:",
@@ -1099,6 +1485,10 @@ while running:
         " [Left Drag] Select Units",
         " [Right Click] Move Here (Precise)",
         " [Z] Attack/Follow Unit (Touch)",
+        " [X] Move (Low Priority Waypoint)",
+        " [N] Toggle Melee/Ranged",
+        " [C] Cancel Target (Auto-target)",
+        " [Ctrl+1~9] Assign Group",
         " [TAB] Switch Algorithm",
         " [V] Toggle Debug",
         " [F3] Toggle Obstacle Mode",
@@ -1108,6 +1498,7 @@ while running:
         f"Circles: {len(circles)}",
         f"Obstacles: {len(obstacles)}",
         f"Selected: {len(selected_circles)}",
+        f"Groups: {', '.join(f'G{k}:{v}' for k, v in sorted(group_counts.items())) if group_counts else 'None'}",
         f"Algorithm: {avoidance_manager.get_algorithm().get_name() if avoidance_manager.get_algorithm() else 'None'}",
         f"Debug: {avoidance_config.DEBUG_ENABLED}",
         f"Obstacle Mode: {'ON' if obstacle_placement_mode else 'OFF'}",

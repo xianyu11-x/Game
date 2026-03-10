@@ -38,10 +38,34 @@ class PredictiveScanAvoidance(AvoidanceBase):
 
         target_angle = self._angle_to_target(circle, target_x, target_y)
 
+        # First pass: compute blocked intervals with base prediction_time to evaluate
+        # whether concave detection should be active (gate check).
+        base_speed = self._get_scan_speed(circle)
+        base_prediction_time = self.config["prediction_time"]
+        base_det_r = self._get_detection_radius(circle, base_speed, base_prediction_time, target_x, target_y)
+        base_neighbors = self._get_neighbors_in_radius(circle, all_circles, base_det_r)
+        base_blocked = self._get_blocked_intervals(circle, base_neighbors, base_speed, base_prediction_time)
+        base_obs_blocked = self._get_obstacle_blocked_intervals(
+            circle, base_det_r, base_speed, base_prediction_time)
+        if base_obs_blocked:
+            base_blocked = self._merge_intervals(base_blocked + base_obs_blocked)
+
+        # Gate concave detection based on total blocked angle range.
+        # Activates when total blocked is between concave_total_min_deg and concave_total_max_deg.
+        if self.config.get("concave_detection_enabled", True) and base_blocked:
+            total_blocked = sum(e - s for s, e in base_blocked)
+            concave_min_total = self.config.get("concave_total_min_deg", 180.0)
+            concave_max_total = self.config.get("concave_total_max_deg", 270.0)
+            if not (concave_min_total <= total_blocked <= concave_max_total):
+                circle["concave_timer"] = 0.0
+                circle["concave_last_distance"] = None
+        elif self.config.get("concave_detection_enabled", True):
+            circle["concave_timer"] = 0.0
+            circle["concave_last_distance"] = None
+
         prediction_time = self._get_prediction_time(circle, target_x, target_y, delta_time)
-        speed = self._get_scan_speed(circle)
+        speed = base_speed
         detection_radius = self._get_detection_radius(circle, speed, prediction_time, target_x, target_y)
-        move_radius = detection_radius
 
         neighbors = self._get_neighbors_in_radius(circle, all_circles, detection_radius)
 
@@ -52,6 +76,7 @@ class PredictiveScanAvoidance(AvoidanceBase):
             circle, detection_radius, speed, prediction_time)
         if obstacle_blocked:
             blocked_intervals = self._merge_intervals(blocked_intervals + obstacle_blocked)
+
         allowed_intervals = self._get_allowed_intervals(blocked_intervals)
 
         if avoidance_config.DEBUG_ENABLED:
@@ -73,6 +98,13 @@ class PredictiveScanAvoidance(AvoidanceBase):
         )
         if selected_angle is None:
             return self._apply_fallback(circle, target_angle, delta_time)
+
+        # Restore decel_factor when passable space is available
+        accel_rate = self.config.get("fallback_accel_rate", 5.0)
+        decel_factor = circle.get("decel_factor", 1.0)
+        if decel_factor < 1.0:
+            decel_factor = min(1.0, decel_factor + accel_rate * delta_time)
+            circle["decel_factor"] = decel_factor
 
         self._update_reverse_cooldown(circle, selected_angle, target_angle, delta_time)
         return self._move_with_angle(circle, selected_angle, delta_time)
@@ -386,9 +418,14 @@ class PredictiveScanAvoidance(AvoidanceBase):
         Corner circles: same time-parametric intersection logic as circle-circle
                         detection (_get_blocked_intervals), ensuring consistent
                         behaviour and natural detection-radius clipping.
+        
+        Uses a fixed prediction time for static obstacles (configurable).
         """
         if not self.obstacles:
             return []
+        
+        # Use fixed prediction time for static obstacles
+        prediction_time = self.config.get("obstacle_prediction_time", prediction_time)
         
         blocked = []
         ax, ay = circle["x"], circle["y"]
@@ -539,12 +576,22 @@ class PredictiveScanAvoidance(AvoidanceBase):
         return self._merge_intervals(blocked) if blocked else []
 
     def _apply_fallback(self, circle, target_angle, delta_time):
-        fallback = self.config["fallback_method"]
-        if fallback == "stop":
+        """Gradually decelerate to a stop when no passable space is available."""
+        decel_rate = self.config.get("fallback_decel_rate", 3.0)  # speed reduction per second
+        decel_factor = circle.get("decel_factor", 1.0)
+        decel_factor = max(0.0, decel_factor - decel_rate * delta_time)
+        circle["decel_factor"] = decel_factor
+
+        if decel_factor <= 0.01:
+            # Fully stopped
             return (circle["x"], circle["y"], circle["angle"])
-        if fallback == "target":
-            return self._move_with_angle(circle, target_angle, delta_time)
-        return self._move_with_angle(circle, circle["angle"], delta_time)
+
+        # Move at reduced speed in current heading direction
+        move_distance = circle["speed"] * decel_factor * delta_time
+        angle_rad = math.radians(circle["angle"])
+        new_x = circle["x"] + move_distance * math.cos(angle_rad)
+        new_y = circle["y"] + move_distance * math.sin(angle_rad)
+        return (new_x, new_y, circle["angle"])
 
     def _move_with_angle(self, circle, angle, delta_time):
         move_distance = circle["speed"] * delta_time

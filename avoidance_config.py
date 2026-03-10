@@ -14,18 +14,20 @@ AVOIDANCE_CONFIG = {
         "name": "Predictive Scan",
         "description": "Predicts collisions by scanning candidate angles within a look-ahead circle",
         # Core prediction settings
-        "prediction_time": 0.5,
+        "prediction_time": 1,
         "speed_override": None,  # Set to a number to override circle["speed"]
         "speed_factor": 1.0,     # Multiplies circle["speed"] when no override is set
         # Detection radius derived from speed * prediction_time
-        "detection_radius_factor": 1.5,
+        "detection_radius_factor": 2,
         "detection_radius_min": 40.0,
         "detection_radius_max": 260.0,
     # Angle scanning (debug-only: used for visualization sampling)
     "angle_step_deg": 10.0,
         # Collision checking
-        "collision_padding": 2.0,
-        "neighbor_speed_factor": 1.0,
+    "collision_padding": 0.0,
+    "neighbor_speed_factor": 1.0,
+    # Static obstacle prediction time (fixed, independent of concave growth)
+    "obstacle_prediction_time": 0.01,
     # Parametric time sampling for feasibility solving
     "time_samples": 16,
     # Turn penalty to discourage large heading changes
@@ -48,10 +50,13 @@ AVOIDANCE_CONFIG = {
     "concave_time_growth": 0.6,
     "concave_time_max": 4.0,
     "concave_decay": 0.8,
+    "concave_total_min_deg": 180.0,    # Concave activates when total blocked >= this
+    "concave_total_max_deg": 330.0,    # Concave deactivates when total blocked > this
         # Angle selection strategy
         "angle_selection_method": "closest_to_target",
-        # Fallback when no angles are available: keep_current | stop | target
-        "fallback_method": "keep_current",
+        # Fallback: gradual deceleration when no passable space
+        "fallback_decel_rate": 3.0,    # decel_factor reduction per second (reaches 0 in ~0.33s)
+        "fallback_accel_rate": 5.0,    # decel_factor recovery per second when space opens
     }
     ,
     "predictive_scan_parallel": {
@@ -68,8 +73,10 @@ AVOIDANCE_CONFIG = {
         # Angle scanning (debug-only: used for visualization sampling)
         "angle_step_deg": 10.0,
         # Collision checking
-        "collision_padding": 2.0,
+        "collision_padding": 0.0,
         "neighbor_speed_factor": 1.0,
+        # Static obstacle prediction time (fixed, independent of concave growth)
+        "obstacle_prediction_time": 0.01,
         # Parametric time sampling for feasibility solving
         "time_samples": 16,
         # Parallelization
@@ -94,10 +101,13 @@ AVOIDANCE_CONFIG = {
         "concave_time_growth": 0.6,
         "concave_time_max": 4.0,
         "concave_decay": 0.8,
+        "concave_total_min_deg": 180.0,
+        "concave_total_max_deg": 330.0,
         # Angle selection strategy
         "angle_selection_method": "closest_to_target",
-        # Fallback when no angles are available: keep_current | stop | target
-        "fallback_method": "keep_current",
+        # Fallback: gradual deceleration when no passable space
+        "fallback_decel_rate": 3.0,
+        "fallback_accel_rate": 5.0,
     }
     ,
     "predictive_scan_vectorized": {
@@ -114,8 +124,10 @@ AVOIDANCE_CONFIG = {
         # Angle scanning (debug-only: used for visualization sampling)
         "angle_step_deg": 10.0,
         # Collision checking
-        "collision_padding": 2.0,
+        "collision_padding": 0.0,
         "neighbor_speed_factor": 1.0,
+        # Static obstacle prediction time (fixed, independent of concave growth)
+        "obstacle_prediction_time": 0.01,
         # Parametric time sampling for feasibility solving
         "time_samples": 16,
         # Turn penalty to discourage large heading changes
@@ -138,11 +150,35 @@ AVOIDANCE_CONFIG = {
         "concave_time_growth": 0.6,
         "concave_time_max": 4.0,
         "concave_decay": 0.8,
+        "concave_total_min_deg": 180.0,
+        "concave_total_max_deg": 330.0,
         # Angle selection strategy
         "angle_selection_method": "closest_to_target",
-        # Fallback when no angles are available: keep_current | stop | target
-        "fallback_method": "keep_current",
-    }
+        # Fallback: gradual deceleration when no passable space
+        "fallback_decel_rate": 3.0,
+        "fallback_accel_rate": 5.0,
+    },
+    "rvo2": {
+        "name": "RVO2",
+        "description": "Official RVO2 algorithm port (ORCA with correct LP solver)",
+        "neighbor_dist": 150.0,
+        "max_neighbors": 10,
+        "time_horizon": 2.5,        # prediction horizon for agents
+        "time_horizon_obst": 0.5,   # prediction horizon for obstacles
+        "stationary_responsibility": 1.0,  # stationary neighbor: 1.0 means full responsibility
+        "stuck_speed_threshold": 6.0,      # if solved speed is too low, try anti-deadlock retry
+        "stuck_pref_speed_min": 20.0,      # only trigger retry when agent still wants to move
+        "stuck_target_dist_min": 40.0,     # do not retry when already near target
+        "stuck_side_bias": 0.30,           # side-bias ratio of max_speed for retry objective
+        "attack_range_hard_stop": True,    # stop immediately when target is in attack range
+    },
+    "minkowski_tangent": {
+        "name": "Minkowski Tangent",
+        "description": "Tangent-based avoidance using Minkowski sum grouping",
+        "detection_radius": 600.0,
+        "collision_padding": 5.0,
+        "tangent_margin_deg": 0,
+    },
 }
 
 
