@@ -281,7 +281,9 @@ class PredictiveScanAvoidance(AvoidanceBase):
         return (neighbor["x"] + dx, neighbor["y"] + dy)
 
     def _get_neighbor_speed(self, neighbor):
-        """Return predicted neighbor speed; stationary targets contribute zero speed."""
+        """Return predicted neighbor speed; stationary/anchored units contribute zero speed."""
+        if neighbor.get("anchored"):
+            return 0.0
         if neighbor.get("target_x") is None or neighbor.get("target_y") is None:
             return 0.0
         if neighbor.get("speed", 0.0) <= 0.01:

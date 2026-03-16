@@ -71,8 +71,11 @@ def check_collision(x1, y1, radius1, x2, y2, radius2):
     return distance < (radius1 + radius2)
 
 def get_collision_response(circle, other_circles):
-    """Calculate collision response to push circles apart"""
+    """Calculate collision response to push circles apart.
+    Anchored circles (ranged units in attack range) are treated as immovable."""
     import math
+    if circle.get("anchored"):
+        return 0, 0
     push_x = 0
     push_y = 0
     
@@ -84,7 +87,6 @@ def get_collision_response(circle, other_circles):
         overlap = (circle["radius"] + other["radius"]) - distance
         
         if overlap > 0:
-            # Calculate push direction (away from other circle)
             if distance > 0:
                 push_x -= (other["x"] - circle["x"]) / distance * overlap * 0.5
                 push_y -= (other["y"] - circle["y"]) / distance * overlap * 0.5
@@ -98,43 +100,207 @@ def get_closest_reachable_target(
     target_radius,
     all_circles,
     extra_margin=5.0,
+    obstacles_list=None,
+    attack_range=None,
 ):
-    """Return closest reachable point on the Minkowski circle around the target."""
+    """Return closest reachable point on an approach circle around the target.
+
+    For ranged units pass *attack_range* (centre-to-centre distance) to prefer
+    standing at max attack distance.  Falls back to the collision circle when
+    the attack-range circle is fully blocked.
+
+    Fully analytical: blocked arcs from other circles via law of cosines;
+    blocked arcs from rectangular obstacles via circle / rounded-rect
+    intersection (4 line segments + 4 corner arcs).
+    """
     if target_radius <= 0.0:
         return target_x, target_y
 
-    base_radius = circle["radius"] + target_radius + extra_margin
+    collision_R = circle["radius"] + target_radius + extra_margin
     desired_angle = math.atan2(circle["y"] - target_y, circle["x"] - target_x)
+    TWO_PI = 2.0 * math.pi
+    cr = circle["radius"]
 
-    samples = 48
-    best_point = None
-    best_angle_diff = None
+    # ------------------------------------------------------------------
+    def _solve_at_radius(R):
+        """Find the best free angle on a circle of radius *R* centred on the
+        target.  Returns ``((x, y), blocked_arcs)`` on success, or
+        ``(None, blocked_arcs)`` when every angle is blocked."""
+        blocked_arcs = []
 
-    for i in range(samples):
-        angle = (2 * math.pi * i) / samples
-        candidate_x = target_x + base_radius * math.cos(angle)
-        candidate_y = target_y + base_radius * math.sin(angle)
-
-        ok = True
         for other in all_circles:
             if other is circle:
                 continue
-            min_dist = circle["radius"] + other["radius"] + extra_margin
-            if math.hypot(candidate_x - other["x"], candidate_y - other["y"]) < min_dist:
-                ok = False
-                break
+            min_dist = cr + other["radius"] + extra_margin
+            d = math.hypot(other["x"] - target_x, other["y"] - target_y)
+            if d < 1e-9:
+                if R < min_dist:
+                    return None, blocked_arcs
+                continue
+            cos_val = (d * d + R * R - min_dist * min_dist) / (2.0 * d * R)
+            if cos_val <= -1.0:
+                return None, blocked_arcs
+            if cos_val >= 1.0:
+                continue
+            half_angle = math.acos(cos_val)
+            center_angle = math.atan2(other["y"] - target_y, other["x"] - target_x)
+            blocked_arcs.append((center_angle, half_angle))
 
-        if not ok:
-            continue
+        if obstacles_list:
+            for obs in obstacles_list:
+                hw = obs["w"] / 2.0
+                hh = obs["h"] / 2.0
+                half_diag = math.hypot(hw, hh)
+                d_obs = math.hypot(obs["cx"] - target_x, obs["cy"] - target_y)
+                if d_obs - R > half_diag + cr:
+                    continue
 
-        angle_diff = abs((angle - desired_angle + math.pi) % (2 * math.pi) - math.pi)
-        if best_point is None or angle_diff < best_angle_diff:
-            best_point = (candidate_x, candidate_y)
-            best_angle_diff = angle_diff
+                obs_angle_rad = math.radians(obs["angle"])
+                cos_a = math.cos(-obs_angle_rad)
+                sin_a = math.sin(-obs_angle_rad)
+                dx = target_x - obs["cx"]
+                dy = target_y - obs["cy"]
+                ltx = dx * cos_a - dy * sin_a
+                lty = dx * sin_a + dy * cos_a
 
-    if best_point is not None:
-        return best_point
+                crossings = []
 
+                for a_val, y_lo, y_hi in ((hw + cr, -hh, hh),
+                                           (-(hw + cr), -hh, hh)):
+                    disc = R * R - (a_val - ltx) ** 2
+                    if disc < 0.0:
+                        continue
+                    sd = math.sqrt(disc)
+                    for y_val in (lty + sd, lty - sd):
+                        if y_lo - 1e-9 <= y_val <= y_hi + 1e-9:
+                            crossings.append(math.atan2(y_val - lty, a_val - ltx))
+
+                for b_val, x_lo, x_hi in ((hh + cr, -hw, hw),
+                                           (-(hh + cr), -hw, hw)):
+                    disc = R * R - (b_val - lty) ** 2
+                    if disc < 0.0:
+                        continue
+                    sd = math.sqrt(disc)
+                    for x_val in (ltx + sd, ltx - sd):
+                        if x_lo - 1e-9 <= x_val <= x_hi + 1e-9:
+                            crossings.append(math.atan2(b_val - lty, x_val - ltx))
+
+                for cx_c, cy_c, qx, qy in ((hw, hh, 1, 1), (-hw, hh, -1, 1),
+                                             (-hw, -hh, -1, -1), (hw, -hh, 1, -1)):
+                    dd = math.hypot(cx_c - ltx, cy_c - lty)
+                    if dd < 1e-9:
+                        continue
+                    cv = (dd * dd + R * R - cr * cr) / (2.0 * dd * R)
+                    if cv < -1.0 or cv > 1.0:
+                        continue
+                    base = math.atan2(cy_c - lty, cx_c - ltx)
+                    ha = math.acos(max(-1.0, min(1.0, cv)))
+                    for theta in (base + ha, base - ha):
+                        px = ltx + R * math.cos(theta)
+                        py = lty + R * math.sin(theta)
+                        if qx > 0 and px < hw - 1e-9:
+                            continue
+                        if qx < 0 and px > -hw + 1e-9:
+                            continue
+                        if qy > 0 and py < hh - 1e-9:
+                            continue
+                        if qy < 0 and py > -hh + 1e-9:
+                            continue
+                        crossings.append(theta)
+
+                def _hit_local(theta):
+                    px = ltx + R * math.cos(theta)
+                    py = lty + R * math.sin(theta)
+                    clx = max(-hw, min(hw, px))
+                    cly = max(-hh, min(hh, py))
+                    ddx = px - clx
+                    ddy = py - cly
+                    return ddx * ddx + ddy * ddy < cr * cr
+
+                if not crossings:
+                    if _hit_local(0.0):
+                        return None, blocked_arcs
+                    continue
+
+                crossings.sort()
+                filtered = [crossings[0]]
+                for c_val in crossings[1:]:
+                    if c_val - filtered[-1] > 1e-8:
+                        filtered.append(c_val)
+                crossings = filtered
+                n = len(crossings)
+
+                for i in range(n):
+                    a_start = crossings[i]
+                    a_end = crossings[(i + 1) % n]
+                    if a_end <= a_start:
+                        a_end += TWO_PI
+                    mid = a_start + (a_end - a_start) / 2.0
+                    if _hit_local(mid):
+                        w_start = a_start + obs_angle_rad
+                        w_end = a_end + obs_angle_rad
+                        arc_center = (w_start + w_end) / 2.0
+                        arc_half = (w_end - w_start) / 2.0
+                        blocked_arcs.append((arc_center, arc_half))
+
+        # --- pick closest free angle to desired_angle ---
+        if not blocked_arcs:
+            return (target_x + R * math.cos(desired_angle),
+                    target_y + R * math.sin(desired_angle)), blocked_arcs
+
+        def _is_blocked(a):
+            for c_a, h_a in blocked_arcs:
+                if abs((a - c_a + math.pi) % TWO_PI - math.pi) < h_a:
+                    return True
+            return False
+
+        if not _is_blocked(desired_angle):
+            return (target_x + R * math.cos(desired_angle),
+                    target_y + R * math.sin(desired_angle)), blocked_arcs
+
+        best_angle = None
+        best_diff = float('inf')
+        eps = 1e-4
+        for c_a, h_a in blocked_arcs:
+            for candidate in (c_a + h_a + eps, c_a - h_a - eps):
+                if not _is_blocked(candidate):
+                    diff = abs((candidate - desired_angle + math.pi) % TWO_PI - math.pi)
+                    if diff < best_diff:
+                        best_diff = diff
+                        best_angle = candidate
+
+        if best_angle is not None:
+            return (target_x + R * math.cos(best_angle),
+                    target_y + R * math.sin(best_angle)), blocked_arcs
+
+        return None, blocked_arcs
+    # ------------------------------------------------------------------
+
+    debug = {"tx": target_x, "ty": target_y, "desired": desired_angle,
+             "R_col": collision_R, "blocked_col": [],
+             "R_atk": None, "blocked_atk": [], "used": "col"}
+
+    if attack_range is not None and attack_range > collision_R:
+        result, b_arcs = _solve_at_radius(attack_range)
+        debug["R_atk"] = attack_range
+        debug["blocked_atk"] = b_arcs
+        if result is not None:
+            debug["used"] = "atk"
+            circle["_debug_approach"] = debug
+            return result
+        # Attack circle fully blocked → still move toward attack circle at desired angle;
+        # let the avoidance algorithm handle pathfinding around blockers.
+        debug["used"] = "atk_move"
+        circle["_debug_approach"] = debug
+        return (target_x + attack_range * math.cos(desired_angle),
+                target_y + attack_range * math.sin(desired_angle))
+
+    result, b_arcs = _solve_at_radius(collision_R)
+    debug["blocked_col"] = b_arcs
+    circle["_debug_approach"] = debug
+
+    if result is not None:
+        return result
     return target_x, target_y
 
 AUTO_TARGET_SCAN_INTERVAL = 1.0  # 索敌扫描间隔（秒）
@@ -259,6 +425,7 @@ def update_auto_targeting(all_circles, delta_time):
 
 def move_circle_towards_target(circle, delta_time, all_circles, avoidance_algorithm):
     """Move circle towards its target position with speed and rotation, using avoidance plugin"""
+    circle["anchored"] = False
     if circle["target_x"] is None or circle["target_y"] is None:
         return
 
@@ -282,6 +449,11 @@ def move_circle_towards_target(circle, delta_time, all_circles, avoidance_algori
     extra_margin = 5.0
     target_radius = circle.get("target_radius", 0.0) or 0.0
     base_radius = circle["radius"] + target_radius + extra_margin if target_radius > 0.0 else 0.0
+    atk_range = None
+    if circle.get("unit_type") == "ranged" and target_radius > 0.0:
+        atk_range = circle.get("attack_range")
+    preferred_R = atk_range if atk_range and atk_range > base_radius else base_radius
+    arrival_threshold = circle.get("arrival_threshold", 1)
     reach_x, reach_y = get_closest_reachable_target(
         circle,
         circle["target_x"],
@@ -289,55 +461,64 @@ def move_circle_towards_target(circle, delta_time, all_circles, avoidance_algori
         target_radius,
         all_circles,
         extra_margin=extra_margin,
+        obstacles_list=obstacles,
+        attack_range=atk_range,
     )
     if avoidance_config.DEBUG_ENABLED:
         circle["debug_reachable_target"] = (reach_x, reach_y)
     else:
         circle["debug_reachable_target"] = None
 
-    distance_to_target = math.hypot(circle["target_x"] - circle["x"], circle["target_y"] - circle["y"])
-    arrival_threshold = circle.get("arrival_threshold", 5)
-    if distance_to_target < arrival_threshold:
-        if circle.get("waypoint_x") is not None and circle.get("target_ref") is None:
-            circle["waypoint_x"] = None
-            circle["waypoint_y"] = None
-        circle["target_x"] = None
-        circle["target_y"] = None
-        circle["target_radius"] = None
-        circle["target_ref"] = None
+    dist_to_center = math.hypot(circle["target_x"] - circle["x"], circle["target_y"] - circle["y"])
+    arrived = False
+    if target_radius > 0.0 and dist_to_center <= preferred_R:
+        arrived = True
+    elif target_radius <= 0.0 and dist_to_center < arrival_threshold:
+        arrived = True
+
+    if arrived:
         circle["debug_reachable_target"] = None
+        circle["anchored"] = True
+        if circle.get("target_ref") is None:
+            if circle.get("waypoint_x") is not None:
+                circle["waypoint_x"] = None
+                circle["waypoint_y"] = None
+            circle["target_x"] = None
+            circle["target_y"] = None
+            circle["target_radius"] = None
+            circle["target_ref"] = None
         return
-    
+
     # Calculate direction to target
     dx = reach_x - circle["x"]
     dy = reach_y - circle["y"]
-    
+
     # Calculate target angle (in degrees)
     target_angle = math.degrees(math.atan2(dy, dx))
-    
+
     # Normalize angles to -180 to 180
     current_angle = circle["angle"] % 360
     if current_angle > 180:
         current_angle -= 360
-    
+
     target_angle = target_angle % 360
     if target_angle > 180:
         target_angle -= 360
-    
+
     # Calculate angle difference
     angle_diff = target_angle - current_angle
     if angle_diff > 180:
         angle_diff -= 360
     elif angle_diff < -180:
         angle_diff += 360
-    
+
     # Rotate towards target
     max_rotation = circle["turn_speed"] * delta_time
     if abs(angle_diff) < max_rotation:
         circle["angle"] = target_angle
     else:
         circle["angle"] += max_rotation if angle_diff > 0 else -max_rotation
-    
+
     # Use avoidance algorithm if available
     if avoidance_algorithm:
         result = avoidance_algorithm.calculate_avoidance(
@@ -347,47 +528,26 @@ def move_circle_towards_target(circle, delta_time, all_circles, avoidance_algori
             new_x, new_y, new_angle = result
             circle["x"] = new_x
             circle["y"] = new_y
-            # Update angle from avoidance algorithm for smoother behavior
             circle["angle"] = new_angle
     else:
-        # Fallback to simple movement
         move_distance = circle["speed"] * delta_time
         circle["x"] += move_distance * math.cos(math.radians(circle["angle"]))
         circle["y"] += move_distance * math.sin(math.radians(circle["angle"]))
-    
+
     # Apply collision response to separate overlapping circles
     if circle["target_x"] is not None and circle["target_y"] is not None:
         push_x, push_y = get_collision_response(circle, all_circles)
         circle["x"] += push_x
         circle["y"] += push_y
 
-        distance_to_target = math.hypot(circle["target_x"] - circle["x"], circle["target_y"] - circle["y"])
-        if distance_to_target < arrival_threshold:
-            if circle.get("waypoint_x") is not None and circle.get("target_ref") is None:
-                circle["waypoint_x"] = None
-                circle["waypoint_y"] = None
-            circle["target_x"] = None
-            circle["target_y"] = None
-            circle["target_radius"] = None
-            circle["target_ref"] = None
-            circle["debug_reachable_target"] = None
-            return
-
-        if target_radius > 0.0 and distance_to_target < base_radius:
-            reach_x, reach_y = get_closest_reachable_target(
-                circle,
-                circle["target_x"],
-                circle["target_y"],
-                target_radius,
-                all_circles,
-                extra_margin=extra_margin,
-            )
-            if avoidance_config.DEBUG_ENABLED:
-                circle["debug_reachable_target"] = (reach_x, reach_y)
-            else:
-                circle["debug_reachable_target"] = None
-            circle["x"] = reach_x
-            circle["y"] = reach_y
+        # Prevent penetrating the collision circle around the target
+        if target_radius > 0.0:
+            dist_center = math.hypot(circle["target_x"] - circle["x"], circle["target_y"] - circle["y"])
+            if dist_center < base_radius:
+                a = math.atan2(circle["y"] - circle["target_y"],
+                               circle["x"] - circle["target_x"])
+                circle["x"] = circle["target_x"] + base_radius * math.cos(a)
+                circle["y"] = circle["target_y"] + base_radius * math.sin(a)
 
 def draw_grid(surface, camera_x, camera_y):
     """Draw grid background"""
@@ -398,6 +558,74 @@ def draw_grid(surface, camera_x, camera_y):
     # Horizontal lines
     for y in range(-camera_y % grid_size, WINDOW_HEIGHT, grid_size):
         pygame.draw.line(surface, (200, 200, 200), (0, y), (WINDOW_WIDTH, y), 1)
+
+def draw_reachable_arcs(surface, circle, camera_x, camera_y):
+    """Visualise blocked / free arcs on the approach circle around the target.
+
+    Green arc = reachable, red arc = blocked.  When an attack-range circle is
+    present (ranged units), the outer circle shows attack-range arcs and the
+    inner collision circle is drawn as a grey dashed reference.
+    """
+    info = circle.get("_debug_approach")
+    if not info:
+        return
+    tx, ty = info["tx"], info["ty"]
+    desired = info["desired"]
+    sx, sy = world_to_screen(tx, ty, camera_x, camera_y)
+    TWO_PI = 2.0 * math.pi
+
+    def _draw_arcs(R, blocked, width=2):
+        def _chk(a):
+            for c, h in blocked:
+                if abs((a - c + math.pi) % TWO_PI - math.pi) < h:
+                    return True
+            return False
+        steps = 180
+        prev_ok = not _chk(0.0)
+        prev_px = sx + R
+        prev_py = sy
+        for i in range(1, steps + 1):
+            a = TWO_PI * i / steps
+            cur_ok = not _chk(a)
+            cur_px = sx + R * math.cos(a)
+            cur_py = sy + R * math.sin(a)
+            col = (0, 220, 80) if prev_ok and cur_ok else (220, 40, 40)
+            pygame.draw.line(surface, col,
+                             (int(prev_px), int(prev_py)),
+                             (int(cur_px), int(cur_py)), width)
+            prev_ok = cur_ok
+            prev_px = cur_px
+            prev_py = cur_py
+
+    def _draw_dashed_circle(R, color=(120, 120, 120), segs=36):
+        for i in range(segs):
+            if i % 2:
+                continue
+            a1 = TWO_PI * i / segs
+            a2 = TWO_PI * (i + 1) / segs
+            p1 = (int(sx + R * math.cos(a1)), int(sy + R * math.sin(a1)))
+            p2 = (int(sx + R * math.cos(a2)), int(sy + R * math.sin(a2)))
+            pygame.draw.line(surface, color, p1, p2, 1)
+
+    used = info.get("used", "col")
+    R_atk = info.get("R_atk")
+    R_col = info["R_col"]
+
+    if R_atk is not None:
+        if used == "atk":
+            _draw_arcs(R_atk, info["blocked_atk"], 2)
+        else:
+            _draw_arcs(R_atk, info["blocked_atk"], 1)
+        _draw_dashed_circle(R_col)
+
+    if used == "col":
+        _draw_arcs(R_col, info["blocked_col"], 2)
+
+    active_R = R_atk if used == "atk" and R_atk else R_col
+    dx = sx + active_R * math.cos(desired)
+    dy = sy + active_R * math.sin(desired)
+    pygame.draw.line(surface, (255, 255, 255, 180),
+                     (int(sx), int(sy)), (int(dx), int(dy)), 1)
 
 def draw_allowed_angles(surface, circle, camera_x, camera_y, color=(0, 255, 0, 60)):
     """Draw feasible movement area as translucent sectors on the detection circle."""
@@ -1115,7 +1343,7 @@ while running:
                     "speed": 100,
                     "turn_speed": 180,
                     "radius": 25,
-                    "arrival_threshold": 5,
+                    "arrival_threshold": 1,
                     "group": 0,              # 0 = 无分组
                     "unit_type": "melee",    # "melee" 近战 / "ranged" 远程
                     "detection_range": 400,  # 索敌范围
@@ -1280,9 +1508,11 @@ while running:
         current_algorithm.set_obstacles(obstacles)
     for circle in circles:
         move_circle_towards_target(circle, delta_time, circles, current_algorithm)
-    # Apply obstacle hard collision for ALL circles (prevents overlap with obstacles)
+    # Apply obstacle hard collision (skip anchored ranged units)
     if obstacles:
         for circle in circles:
+            if circle.get("anchored"):
+                continue
             obs_px, obs_py = get_obstacle_push(circle, obstacles)
             circle["x"] += obs_px
             circle["y"] += obs_py
@@ -1397,6 +1627,10 @@ while running:
                     pygame.draw.line(screen, (255, 140, 0),
                                    (int(reach_screen_x), int(reach_screen_y - 4)),
                                    (int(reach_screen_x), int(reach_screen_y + 4)), 2)
+
+            # Draw approach-circle reachable arcs for selected circles
+            if avoidance_config.DEBUG_ENABLED and circle in selected_circles:
+                draw_reachable_arcs(screen, circle, camera_x, camera_y)
 
             # Draw feasible angles and velocity direction for selected circles
             if avoidance_config.DEBUG_ENABLED and circle in selected_circles:
